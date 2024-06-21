@@ -81,7 +81,7 @@ func testCopyRelativeParents(t *testing.T, sb integration.Sandbox) {
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
-FROM alpine AS base
+FROM alpine:3 AS base
 WORKDIR /test
 RUN <<eot
 	set -ex
@@ -96,7 +96,7 @@ RUN <<eot
 	touch a/b/c2/d/e2/baz
 eot
 
-FROM alpine AS middle
+FROM alpine:3 AS middle
 COPY --from=base --parents /test/a/b/./c/d /out/
 RUN <<eot
 	set -ex
@@ -106,7 +106,7 @@ RUN <<eot
 	[ ! -d /out/e ]
 eot
 
-FROM alpine AS end
+FROM alpine:3 AS end
 COPY --from=base --parents /test/a/b/c/d/. /out/
 RUN <<eot
 	set -ex
@@ -114,7 +114,7 @@ RUN <<eot
 	[ -f /out/test/a/b/c/d/foo ]
 eot
 
-FROM alpine AS start
+FROM alpine:3 AS start
 COPY --from=base --parents ./test/a/b/c/d /out/
 RUN <<eot
 	set -ex
@@ -122,7 +122,7 @@ RUN <<eot
 	[ -f /out/test/a/b/c/d/foo ]
 eot
 
-FROM alpine AS double
+FROM alpine:3 AS double
 COPY --from=base --parents /test/a/./b/./c /out/
 RUN <<eot
 	set -ex
@@ -130,7 +130,7 @@ RUN <<eot
 	[ -f /out/b/c/d/foo ]
 eot
 
-FROM alpine AS wildcard
+FROM alpine:3 AS wildcard
 COPY --from=base --parents /test/a/./*/c /out/
 RUN <<eot
 	set -ex
@@ -138,7 +138,7 @@ RUN <<eot
 	[ -f /out/b2/c/d/e/bar ]
 eot
 
-FROM alpine AS doublewildcard
+FROM alpine:3 AS doublewildcard
 COPY --from=base --parents /test/a/b*/./c/**/e /out/
 RUN <<eot
 	set -ex
@@ -147,7 +147,7 @@ RUN <<eot
 	[ -f /out/c/d/e/bar ] # via b2
 eot
 
-FROM alpine AS doubleinputs
+FROM alpine:3 AS doubleinputs
 COPY --from=base --parents /test/a/b/c*/./d/**/baz /test/a/b*/./c/**/bar /out/
 RUN <<eot
 	set -ex
