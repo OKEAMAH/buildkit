@@ -58,7 +58,7 @@ func testAddGit(t *testing.T, sb integration.Sandbox) {
 	t.Logf("serverURL=%q", serverURL)
 
 	dockerfile, err := applyTemplate(`
-FROM alpine
+FROM alpine:3.20.3
 
 # Basic case
 ADD {{.ServerURL}}/.git#v0.0.1 /x
