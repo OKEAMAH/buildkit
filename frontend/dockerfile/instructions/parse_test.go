@@ -74,6 +74,9 @@ func TestCommandsTooManyArguments(t *testing.T) {
 					Value: "arg2",
 					Next: &parser.Node{
 						Value: "arg3",
+						Next: &parser.Node{
+							Value: "",
+						},
 					},
 				},
 			},
@@ -97,6 +100,9 @@ func TestCommandsBlankNames(t *testing.T) {
 				Value: "",
 				Next: &parser.Node{
 					Value: "arg2",
+					Next: &parser.Node{
+						Value: "=",
+					},
 				},
 			},
 		}
@@ -143,6 +149,30 @@ func TestParseOptInterval(t *testing.T) {
 	flInterval.Value = "1ms"
 	_, err = parseOptInterval(flInterval)
 	require.NoError(t, err)
+}
+
+func TestNilLinter(t *testing.T) {
+	for cmd := range command.Commands {
+		cmd := cmd
+		t.Run(cmd, func(t *testing.T) {
+			t.Parallel()
+
+			for _, tc := range []string{
+				cmd + " foo=bar",
+				cmd + " a",
+				cmd + " a b",
+				cmd + " a b c",
+				cmd + " 0 0",
+			} {
+				t.Run(tc, func(t *testing.T) {
+					ast, err := parser.Parse(strings.NewReader("FROM busybox\n" + tc))
+					if err == nil {
+						_, _, _ = Parse(ast.AST, nil)
+					}
+				})
+			}
+		})
+	}
 }
 
 func TestCommentsDetection(t *testing.T) {
@@ -239,7 +269,7 @@ func TestRunCmdFlagsUsed(t *testing.T) {
 	n := ast.AST.Children[0]
 	c, err := ParseInstruction(n)
 	require.NoError(t, err)
-	require.IsType(t, c, &RunCommand{})
+	require.IsType(t, &RunCommand{}, c)
 	require.Equal(t, []string{"mount"}, c.(*RunCommand).FlagsUsed)
 }
 

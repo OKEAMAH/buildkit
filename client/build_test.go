@@ -28,7 +28,6 @@ import (
 	"github.com/moby/buildkit/util/testutil/echoserver"
 	"github.com/moby/buildkit/util/testutil/integration"
 	"github.com/moby/buildkit/util/testutil/workers"
-	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 	"github.com/tonistiigi/fsutil"
@@ -210,43 +209,14 @@ func testWarnings(t *testing.T, sb integration.Sandbox) {
 		return r, nil
 	}
 
-	status := make(chan *SolveStatus)
-	statusDone := make(chan struct{})
-	done := make(chan struct{})
+	wc := newWarningsCapture()
 
-	var warnings []*VertexWarning
-	vertexes := map[digest.Digest]struct{}{}
-
-	go func() {
-		defer close(statusDone)
-		for {
-			select {
-			case st, ok := <-status:
-				if !ok {
-					return
-				}
-				for _, s := range st.Vertexes {
-					vertexes[s.Digest] = struct{}{}
-				}
-				warnings = append(warnings, st.Warnings...)
-			case <-done:
-				return
-			}
-		}
-	}()
-
-	_, err = c.Build(ctx, SolveOpt{}, product, b, status)
+	_, err = c.Build(ctx, SolveOpt{}, product, b, wc.status)
 	require.NoError(t, err)
 
-	select {
-	case <-statusDone:
-	case <-time.After(10 * time.Second):
-		close(done)
-	}
+	warnings := wc.wait()
 
-	<-statusDone
-
-	require.Equal(t, 1, len(vertexes))
+	require.Equal(t, 1, len(wc.vertexes))
 	require.Equal(t, 1, len(warnings))
 
 	w := warnings[0]
@@ -257,7 +227,7 @@ func testWarnings(t *testing.T, sb integration.Sandbox) {
 	require.Equal(t, "and more detail", string(w.Detail[1]))
 	require.Equal(t, "https://example.com", w.URL)
 	require.Equal(t, 3, w.Level)
-	_, ok := vertexes[w.Vertex]
+	_, ok := wc.vertexes[w.Vertex]
 	require.True(t, ok)
 
 	require.Equal(t, "mydockerfile", w.SourceInfo.Filename)
@@ -339,7 +309,7 @@ func testUnknownBuildID(t *testing.T, sb integration.Sandbox) {
 	_, err = g.Ping(ctx, &gatewayapi.PingRequest{})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "no such job")
-	require.Equal(t, grpcerrors.Code(err), codes.NotFound)
+	require.Equal(t, codes.NotFound, grpcerrors.Code(err))
 }
 
 // testClientGatewayContainerCancelOnRelease is testing that all running
@@ -462,13 +432,13 @@ func testClientGatewayContainerExecPipe(t *testing.T, sb integration.Sandbox) {
 			Args: []string{"sleep", "10"},
 		})
 		if err != nil {
-			ctr.Release(ctx)
+			ctr.Release(context.WithoutCancel(ctx))
 			return nil, err
 		}
 
 		defer func() {
 			// cancel pid1
-			ctr.Release(ctx)
+			ctr.Release(context.WithoutCancel(ctx))
 			pid1.Wait()
 		}()
 

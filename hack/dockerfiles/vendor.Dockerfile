@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile-upstream:master
 
-ARG GO_VERSION=1.21
-ARG ALPINE_VERSION=3.19
+ARG GO_VERSION=1.22
+ARG ALPINE_VERSION=3.20
 ARG MODOUTDATED_VERSION=v0.9.0
 
 FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS base
@@ -38,7 +38,9 @@ RUN --mount=target=/context \
   fi
 EOT
 
-FROM psampaz/go-mod-outdated:${MODOUTDATED_VERSION} AS go-mod-outdated
+FROM --platform=linux/amd64 psampaz/go-mod-outdated:${MODOUTDATED_VERSION} AS go-mod-outdated-amd64
+
+FROM go-mod-outdated-amd64 AS go-mod-outdated
 FROM base AS outdated
 RUN --mount=target=.,rw \
   --mount=target=/go/pkg/mod,type=cache \

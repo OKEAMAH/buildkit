@@ -3,7 +3,10 @@ package dockerfile
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"maps"
 	"os"
+	"regexp"
 	"sort"
 	"testing"
 	"time"
@@ -22,16 +25,345 @@ import (
 )
 
 var lintTests = integration.TestFuncs(
+	testRuleCheckOption,
 	testStageName,
-	testNoEmptyContinuations,
-	testSelfConsistentCommandCasing,
-	testFileConsistentCommandCasing,
+	testNoEmptyContinuation,
+	testConsistentInstructionCasing,
 	testDuplicateStageName,
 	testReservedStageName,
+	testJSONArgsRecommended,
 	testMaintainerDeprecated,
 	testWarningsBeforeError,
 	testUndeclaredArg,
+	testWorkdirRelativePath,
+	testUnmatchedVars,
+	testMultipleInstructionsDisallowed,
+	testLegacyKeyValueFormat,
+	testBaseImagePlatformMismatch,
+	testAllTargetUnmarshal,
+	testRedundantTargetPlatform,
+	testSecretsUsedInArgOrEnv,
+	testInvalidDefaultArgInFrom,
+	testFromPlatformFlagConstDisallowed,
+	testCopyIgnoredFiles,
 )
+
+func testCopyIgnoredFiles(t *testing.T, sb integration.Sandbox) {
+	dockerignore := []byte(`
+Dockerfile
+`)
+	dockerfile := []byte(`
+FROM scratch
+COPY Dockerfile .
+ADD Dockerfile /windy
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile:           dockerfile,
+		DockerIgnore:         dockerignore,
+		BuildErrLocation:     3,
+		StreamBuildErrRegexp: regexp.MustCompile(`failed to solve: failed to compute cache key: failed to calculate checksum of ref [^\s]+ "/Dockerfile": not found`),
+	})
+
+	dockerfile = []byte(`# check=experimental=CopyIgnoredFile
+FROM scratch
+COPY Dockerfile .
+ADD Dockerfile /windy
+`)
+
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile:           dockerfile,
+		DockerIgnore:         dockerignore,
+		BuildErrLocation:     3,
+		StreamBuildErrRegexp: regexp.MustCompile(`failed to solve: failed to compute cache key: failed to calculate checksum of ref [^\s]+ "/Dockerfile": not found`),
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "CopyIgnoredFile",
+				Description: "Attempting to Copy file that is excluded by .dockerignore",
+				Detail:      `Attempting to Copy file "Dockerfile" that is excluded by .dockerignore`,
+				URL:         "https://docs.docker.com/go/dockerfile/rule/copy-ignored-file/",
+				Level:       1,
+				Line:        3,
+			},
+			{
+				RuleName:    "CopyIgnoredFile",
+				Description: "Attempting to Copy file that is excluded by .dockerignore",
+				Detail:      `Attempting to Add file "Dockerfile" that is excluded by .dockerignore`,
+				URL:         "https://docs.docker.com/go/dockerfile/rule/copy-ignored-file/",
+				Level:       1,
+				Line:        4,
+			},
+		},
+	})
+
+	dockerfile = []byte(`# check=skip=all;experimental=CopyIgnoredFile
+FROM scratch
+COPY Dockerfile .
+ADD Dockerfile /windy
+`)
+
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile:           dockerfile,
+		DockerIgnore:         dockerignore,
+		BuildErrLocation:     3,
+		StreamBuildErrRegexp: regexp.MustCompile(`failed to solve: failed to compute cache key: failed to calculate checksum of ref [^\s]+ "/Dockerfile": not found`),
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "CopyIgnoredFile",
+				Description: "Attempting to Copy file that is excluded by .dockerignore",
+				Detail:      `Attempting to Copy file "Dockerfile" that is excluded by .dockerignore`,
+				URL:         "https://docs.docker.com/go/dockerfile/rule/copy-ignored-file/",
+				Level:       1,
+				Line:        3,
+			},
+			{
+				RuleName:    "CopyIgnoredFile",
+				Description: "Attempting to Copy file that is excluded by .dockerignore",
+				Detail:      `Attempting to Add file "Dockerfile" that is excluded by .dockerignore`,
+				URL:         "https://docs.docker.com/go/dockerfile/rule/copy-ignored-file/",
+				Level:       1,
+				Line:        4,
+			},
+		},
+	})
+
+	dockerignore = []byte(`
+foobar
+`)
+	dockerfile = []byte(`
+FROM scratch AS base
+COPY Dockerfile /foobar
+ADD Dockerfile /windy
+
+FROM base
+COPY --from=base /foobar /Dockerfile
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile:   dockerfile,
+		DockerIgnore: dockerignore,
+	})
+}
+
+func testSecretsUsedInArgOrEnv(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`
+FROM scratch
+ARG SECRET_PASSPHRASE
+ENV SUPER_Secret=foo
+ENV password=bar secret=baz
+ARG super_duper_secret_token=foo auth=bar
+ENV apikey=bar sunflower=foo
+ENV git_key=
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "SecretsUsedInArgOrEnv",
+				Description: "Sensitive data should not be used in the ARG or ENV commands",
+				Detail:      `Do not use ARG or ENV instructions for sensitive data (ARG "SECRET_PASSPHRASE")`,
+				URL:         "https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/",
+				Level:       1,
+				Line:        3,
+			},
+			{
+				RuleName:    "SecretsUsedInArgOrEnv",
+				Description: "Sensitive data should not be used in the ARG or ENV commands",
+				Detail:      `Do not use ARG or ENV instructions for sensitive data (ENV "SUPER_Secret")`,
+				URL:         "https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/",
+				Level:       1,
+				Line:        4,
+			},
+			{
+				RuleName:    "SecretsUsedInArgOrEnv",
+				Description: "Sensitive data should not be used in the ARG or ENV commands",
+				Detail:      `Do not use ARG or ENV instructions for sensitive data (ENV "password")`,
+				URL:         "https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/",
+				Level:       1,
+				Line:        5,
+			},
+			{
+				RuleName:    "SecretsUsedInArgOrEnv",
+				Description: "Sensitive data should not be used in the ARG or ENV commands",
+				Detail:      `Do not use ARG or ENV instructions for sensitive data (ENV "secret")`,
+				URL:         "https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/",
+				Level:       1,
+				Line:        5,
+			},
+			{
+				RuleName:    "SecretsUsedInArgOrEnv",
+				Description: "Sensitive data should not be used in the ARG or ENV commands",
+				Detail:      `Do not use ARG or ENV instructions for sensitive data (ARG "super_duper_secret_token")`,
+				URL:         "https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/",
+				Level:       1,
+				Line:        6,
+			},
+			{
+				RuleName:    "SecretsUsedInArgOrEnv",
+				Description: "Sensitive data should not be used in the ARG or ENV commands",
+				Detail:      `Do not use ARG or ENV instructions for sensitive data (ARG "auth")`,
+				URL:         "https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/",
+				Level:       1,
+				Line:        6,
+			},
+			{
+				RuleName:    "SecretsUsedInArgOrEnv",
+				Description: "Sensitive data should not be used in the ARG or ENV commands",
+				Detail:      `Do not use ARG or ENV instructions for sensitive data (ENV "apikey")`,
+				URL:         "https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/",
+				Level:       1,
+				Line:        7,
+			},
+			{
+				RuleName:    "SecretsUsedInArgOrEnv",
+				Description: "Sensitive data should not be used in the ARG or ENV commands",
+				Detail:      `Do not use ARG or ENV instructions for sensitive data (ENV "git_key")`,
+				URL:         "https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/",
+				Level:       1,
+				Line:        8,
+			},
+		},
+	})
+}
+
+func testAllTargetUnmarshal(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`
+FROM scratch AS first
+COPY $foo .
+
+FROM scratch AS second
+COPY $bar .
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "UndefinedVar",
+				Description: "Variables should be defined before their use",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/undefined-var/",
+				Detail:      "Usage of undefined variable '$bar'",
+				Level:       1,
+				Line:        6,
+			},
+		},
+		UnmarshalWarnings: []expectedLintWarning{
+			{
+				RuleName:    "UndefinedVar",
+				Description: "Variables should be defined before their use",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/undefined-var/",
+				Detail:      "Usage of undefined variable '$foo'",
+				Level:       1,
+				Line:        3,
+			},
+			{
+				RuleName:    "UndefinedVar",
+				Description: "Variables should be defined before their use",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/undefined-var/",
+				Detail:      "Usage of undefined variable '$bar'",
+				Level:       1,
+				Line:        6,
+			},
+		},
+	})
+}
+
+func testRuleCheckOption(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`#check=skip=all
+FROM scratch as base
+copy Dockerfile .
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
+
+	dockerfile = []byte(`#check=skip=all;error=true
+FROM scratch as base
+copy Dockerfile .
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
+
+	dockerfile = []byte(`#check=skip=ConsistentInstructionCasing,FromAsCasing
+FROM scratch as base
+copy Dockerfile .
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
+
+	dockerfile = []byte(`#check=skip=ConsistentInstructionCasing,FromAsCasing;error=true
+FROM scratch as base
+copy Dockerfile .
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
+
+	dockerfile = []byte(`#check=skip=ConsistentInstructionCasing
+FROM scratch as base
+copy Dockerfile .
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "FromAsCasing",
+				Description: "The 'as' keyword should match the case of the 'from' keyword",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/from-as-casing/",
+				Detail:      "'as' and 'FROM' keywords' casing do not match",
+				Line:        2,
+				Level:       1,
+			},
+		},
+	})
+
+	dockerfile = []byte(`#check=skip=ConsistentInstructionCasing;error=true
+FROM scratch as base
+copy Dockerfile .
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "FromAsCasing",
+				Description: "The 'as' keyword should match the case of the 'from' keyword",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/from-as-casing/",
+				Detail:      "'as' and 'FROM' keywords' casing do not match",
+				Line:        2,
+				Level:       1,
+			},
+		},
+		StreamBuildErr:    "failed to solve: lint violation found for rules: FromAsCasing",
+		UnmarshalBuildErr: "lint violation found for rules: FromAsCasing",
+		BuildErrLocation:  2,
+	})
+
+	dockerfile = []byte(`#check=skip=all
+FROM scratch as base
+copy Dockerfile .
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "FromAsCasing",
+				Description: "The 'as' keyword should match the case of the 'from' keyword",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/from-as-casing/",
+				Detail:      "'as' and 'FROM' keywords' casing do not match",
+				Line:        2,
+				Level:       1,
+			},
+		},
+		StreamBuildErr:    "failed to solve: lint violation found for rules: FromAsCasing",
+		UnmarshalBuildErr: "lint violation found for rules: FromAsCasing",
+		BuildErrLocation:  2,
+		FrontendAttrs: map[string]string{
+			"build-arg:BUILDKIT_DOCKERFILE_CHECK": "skip=ConsistentInstructionCasing;error=true",
+		},
+	})
+
+	dockerfile = []byte(`#check=error=true
+FROM scratch as base
+copy Dockerfile .
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		FrontendAttrs: map[string]string{
+			"build-arg:BUILDKIT_DOCKERFILE_CHECK": "skip=all",
+		},
+	})
+}
 
 func testStageName(t *testing.T, sb integration.Sandbox) {
 	dockerfile := []byte(`
@@ -49,6 +381,7 @@ FROM scratch AS base3
 			{
 				RuleName:    "StageNameCasing",
 				Description: "Stage names should be lowercase",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/stage-name-casing/",
 				Detail:      "Stage name 'BadStageName' should be lowercase",
 				Line:        3,
 				Level:       1,
@@ -56,6 +389,7 @@ FROM scratch AS base3
 			{
 				RuleName:    "FromAsCasing",
 				Description: "The 'as' keyword should match the case of the 'from' keyword",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/from-as-casing/",
 				Detail:      "'as' and 'FROM' keywords' casing do not match",
 				Line:        6,
 				Level:       1,
@@ -76,6 +410,7 @@ from scratch as base2
 			{
 				RuleName:    "FromAsCasing",
 				Description: "The 'as' keyword should match the case of the 'from' keyword",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/from-as-casing/",
 				Detail:      "'AS' and 'from' keywords' casing do not match",
 				Line:        3,
 				Level:       1,
@@ -84,7 +419,7 @@ from scratch as base2
 	})
 }
 
-func testNoEmptyContinuations(t *testing.T, sb integration.Sandbox) {
+func testNoEmptyContinuation(t *testing.T, sb integration.Sandbox) {
 	dockerfile := []byte(`
 FROM scratch
 # warning: empty continuation line
@@ -99,18 +434,18 @@ COPY Dockerfile \
 		Dockerfile: dockerfile,
 		Warnings: []expectedLintWarning{
 			{
-				RuleName:    "NoEmptyContinuations",
+				RuleName:    "NoEmptyContinuation",
 				Description: "Empty continuation lines will become errors in a future release",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/no-empty-continuation/",
 				Detail:      "Empty continuation line",
 				Level:       1,
 				Line:        6,
-				URL:         "https://github.com/moby/moby/pull/33719",
 			},
 		},
 	})
 }
 
-func testSelfConsistentCommandCasing(t *testing.T, sb integration.Sandbox) {
+func testConsistentInstructionCasing(t *testing.T, sb integration.Sandbox) {
 	dockerfile := []byte(`
 # warning: 'FROM' should be either lowercased or uppercased
 From scratch as base
@@ -120,9 +455,10 @@ FROM scratch AS base2
 		Dockerfile: dockerfile,
 		Warnings: []expectedLintWarning{
 			{
-				RuleName:    "SelfConsistentCommandCasing",
-				Description: "Commands should be in consistent casing (all lower or all upper)",
-				Detail:      "Command 'From' should be consistently cased",
+				RuleName:    "ConsistentInstructionCasing",
+				Description: "All commands within the Dockerfile should use the same casing (either upper or lower)",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/consistent-instruction-casing/",
+				Detail:      "Command 'From' should match the case of the command majority (uppercase)",
 				Level:       1,
 				Line:        3,
 			},
@@ -130,26 +466,6 @@ FROM scratch AS base2
 	})
 
 	dockerfile = []byte(`
-# warning: 'FROM' should be either lowercased or uppercased
-frOM scratch as base
-from scratch as base2
-`)
-	checkLinterWarnings(t, sb, &lintTestParams{
-		Dockerfile: dockerfile,
-		Warnings: []expectedLintWarning{
-			{
-				RuleName:    "SelfConsistentCommandCasing",
-				Description: "Commands should be in consistent casing (all lower or all upper)",
-				Detail:      "Command 'frOM' should be consistently cased",
-				Line:        3,
-				Level:       1,
-			},
-		},
-	})
-}
-
-func testFileConsistentCommandCasing(t *testing.T, sb integration.Sandbox) {
-	dockerfile := []byte(`
 FROM scratch
 # warning: 'copy' should match command majority's casing (uppercase)
 copy Dockerfile /foo
@@ -160,10 +476,30 @@ COPY Dockerfile /bar
 		Dockerfile: dockerfile,
 		Warnings: []expectedLintWarning{
 			{
-				RuleName:    "FileConsistentCommandCasing",
+				RuleName:    "ConsistentInstructionCasing",
 				Description: "All commands within the Dockerfile should use the same casing (either upper or lower)",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/consistent-instruction-casing/",
 				Detail:      "Command 'copy' should match the case of the command majority (uppercase)",
 				Line:        4,
+				Level:       1,
+			},
+		},
+	})
+
+	dockerfile = []byte(`
+# warning: 'frOM' should be either lowercased or uppercased
+frOM scratch as base
+from scratch as base2
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "ConsistentInstructionCasing",
+				Description: "All commands within the Dockerfile should use the same casing (either upper or lower)",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/consistent-instruction-casing/",
+				Detail:      "Command 'frOM' should match the case of the command majority (lowercase)",
+				Line:        3,
 				Level:       1,
 			},
 		},
@@ -179,8 +515,9 @@ copy Dockerfile /bar
 		Dockerfile: dockerfile,
 		Warnings: []expectedLintWarning{
 			{
-				RuleName:    "FileConsistentCommandCasing",
+				RuleName:    "ConsistentInstructionCasing",
 				Description: "All commands within the Dockerfile should use the same casing (either upper or lower)",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/consistent-instruction-casing/",
 				Detail:      "Command 'COPY' should match the case of the command majority (lowercase)",
 				Line:        4,
 				Level:       1,
@@ -199,8 +536,9 @@ COPY Dockerfile /baz
 		Dockerfile: dockerfile,
 		Warnings: []expectedLintWarning{
 			{
-				RuleName:    "FileConsistentCommandCasing",
+				RuleName:    "ConsistentInstructionCasing",
 				Description: "All commands within the Dockerfile should use the same casing (either upper or lower)",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/consistent-instruction-casing/",
 				Detail:      "Command 'from' should match the case of the command majority (uppercase)",
 				Line:        3,
 				Level:       1,
@@ -219,8 +557,9 @@ copy Dockerfile /baz
 		Dockerfile: dockerfile,
 		Warnings: []expectedLintWarning{
 			{
-				RuleName:    "FileConsistentCommandCasing",
+				RuleName:    "ConsistentInstructionCasing",
 				Description: "All commands within the Dockerfile should use the same casing (either upper or lower)",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/consistent-instruction-casing/",
 				Detail:      "Command 'FROM' should match the case of the command majority (lowercase)",
 				Line:        3,
 				Level:       1,
@@ -241,6 +580,14 @@ COPY Dockerfile /foo
 COPY Dockerfile /bar
 `)
 	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
+
+	dockerfile = []byte(`
+FROM alpine
+RUN <<'EOT'
+env
+EOT
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
 }
 
 func testDuplicateStageName(t *testing.T, sb integration.Sandbox) {
@@ -254,6 +601,7 @@ FROM scratch AS b
 			{
 				RuleName:    "DuplicateStageName",
 				Description: "Stage names should be unique",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/duplicate-stage-name/",
 				Detail:      "Duplicate stage name \"b\", stage names should be unique",
 				Level:       1,
 				Line:        3,
@@ -278,14 +626,16 @@ FROM scratch AS context
 		Warnings: []expectedLintWarning{
 			{
 				RuleName:    "ReservedStageName",
-				Description: "Reserved stage names should not be used to name a stage",
+				Description: "Reserved words should not be used as stage names",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/reserved-stage-name/",
 				Detail:      "Stage name should not use the same name as reserved stage \"scratch\"",
 				Level:       1,
 				Line:        2,
 			},
 			{
 				RuleName:    "ReservedStageName",
-				Description: "Reserved stage names should not be used to name a stage",
+				Description: "Reserved words should not be used as stage names",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/reserved-stage-name/",
 				Detail:      "Stage name should not use the same name as reserved stage \"context\"",
 				Level:       1,
 				Line:        3,
@@ -302,6 +652,76 @@ FROM scratch AS a
 	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
 }
 
+func testJSONArgsRecommended(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`
+FROM scratch
+CMD mycommand
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "JSONArgsRecommended",
+				Description: "JSON arguments recommended for ENTRYPOINT/CMD to prevent unintended behavior related to OS signals",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/json-args-recommended/",
+				Detail:      "JSON arguments recommended for CMD to prevent unintended behavior related to OS signals",
+				Level:       1,
+				Line:        3,
+			},
+		},
+	})
+
+	dockerfile = []byte(`
+FROM scratch
+ENTRYPOINT mycommand
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "JSONArgsRecommended",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/json-args-recommended/",
+				Description: "JSON arguments recommended for ENTRYPOINT/CMD to prevent unintended behavior related to OS signals",
+				Detail:      "JSON arguments recommended for ENTRYPOINT to prevent unintended behavior related to OS signals",
+				Level:       1,
+				Line:        3,
+			},
+		},
+	})
+
+	dockerfile = []byte(`
+FROM scratch
+SHELL ["/usr/bin/customshell"]
+CMD mycommand
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
+
+	dockerfile = []byte(`
+FROM scratch
+SHELL ["/usr/bin/customshell"]
+ENTRYPOINT mycommand
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
+
+	dockerfile = []byte(`
+FROM scratch AS base
+SHELL ["/usr/bin/customshell"]
+
+FROM base
+CMD mycommand
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
+
+	dockerfile = []byte(`
+FROM scratch AS base
+SHELL ["/usr/bin/customshell"]
+
+FROM base
+ENTRYPOINT mycommand
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
+}
+
 func testMaintainerDeprecated(t *testing.T, sb integration.Sandbox) {
 	dockerfile := []byte(`
 FROM scratch
@@ -312,9 +732,9 @@ MAINTAINER me@example.org
 		Warnings: []expectedLintWarning{
 			{
 				RuleName:    "MaintainerDeprecated",
-				Description: "The maintainer instruction is deprecated, use a label instead to define an image author",
+				Description: "The MAINTAINER instruction is deprecated, use a label instead to define an image author",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/maintainer-deprecated/",
 				Detail:      "Maintainer instruction is deprecated in favor of using label",
-				URL:         "https://docs.docker.com/reference/dockerfile/#maintainer-deprecated",
 				Level:       1,
 				Line:        3,
 			},
@@ -330,9 +750,9 @@ LABEL org.opencontainers.image.authors="me@example.org"
 
 func testWarningsBeforeError(t *testing.T, sb integration.Sandbox) {
 	dockerfile := []byte(`
-# warning: stage name should be lowercase
 FROM scratch AS BadStageName
-FROM ${BAR} AS base
+MAINTAINER me@example.org
+BADCMD
 `)
 	checkLinterWarnings(t, sb, &lintTestParams{
 		Dockerfile: dockerfile,
@@ -340,20 +760,22 @@ FROM ${BAR} AS base
 			{
 				RuleName:    "StageNameCasing",
 				Description: "Stage names should be lowercase",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/stage-name-casing/",
 				Detail:      "Stage name 'BadStageName' should be lowercase",
-				Line:        3,
+				Line:        2,
 				Level:       1,
 			},
 			{
-				RuleName:    "UndeclaredArgInFrom",
-				Description: "FROM command must use declared ARGs",
-				Detail:      "FROM argument 'BAR' is not declared",
+				RuleName:    "MaintainerDeprecated",
+				Description: "The MAINTAINER instruction is deprecated, use a label instead to define an image author",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/maintainer-deprecated/",
+				Detail:      "Maintainer instruction is deprecated in favor of using label",
 				Level:       1,
-				Line:        4,
+				Line:        3,
 			},
 		},
-		StreamBuildErr:    "failed to solve: base name (${BAR}) should not be blank",
-		UnmarshalBuildErr: "base name (${BAR}) should not be blank",
+		StreamBuildErr:    "failed to solve: dockerfile parse error on line 4: unknown instruction: BADCMD",
+		UnmarshalBuildErr: "dockerfile parse error on line 4: unknown instruction: BADCMD",
 		BuildErrLocation:  4,
 	})
 }
@@ -387,16 +809,40 @@ COPY Dockerfile .
 		Dockerfile: dockerfile,
 		Warnings: []expectedLintWarning{
 			{
-				RuleName:    "UndeclaredArgInFrom",
+				RuleName:    "UndefinedArgInFrom",
 				Description: "FROM command must use declared ARGs",
-				Detail:      "FROM argument 'BULIDPLATFORM' is not declared",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/undefined-arg-in-from/",
+				Detail:      "FROM argument 'BULIDPLATFORM' is not declared (did you mean BUILDPLATFORM?)",
 				Level:       1,
 				Line:        2,
 			},
 		},
-		StreamBuildErr:    "failed to solve: failed to parse platform : \"\" is an invalid component of \"\": platform specifier component must match \"^[A-Za-z0-9_-]+$\": invalid argument",
-		UnmarshalBuildErr: "failed to parse platform : \"\" is an invalid component of \"\": platform specifier component must match \"^[A-Za-z0-9_-]+$\": invalid argument",
+		StreamBuildErr:    "failed to solve: empty platform value from expression $BULIDPLATFORM (did you mean BUILDPLATFORM?)",
+		UnmarshalBuildErr: "empty platform value from expression $BULIDPLATFORM (did you mean BUILDPLATFORM?)",
 		BuildErrLocation:  2,
+	})
+
+	dockerfile = []byte(`
+ARG MY_OS=linux
+ARG MY_ARCH=amd64
+FROM --platform=linux/${MYARCH} busybox
+COPY Dockerfile .
+	`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "UndefinedArgInFrom",
+				Description: "FROM command must use declared ARGs",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/undefined-arg-in-from/",
+				Detail:      "FROM argument 'MYARCH' is not declared (did you mean MY_ARCH?)",
+				Level:       1,
+				Line:        4,
+			},
+		},
+		StreamBuildErr:    "failed to solve: failed to parse platform linux/${MYARCH}: \"\" is an invalid component of \"linux/\": platform specifier component must match \"^[A-Za-z0-9_-]+$\": invalid argument (did you mean MY_ARCH?)",
+		UnmarshalBuildErr: "failed to parse platform linux/${MYARCH}: \"\" is an invalid component of \"linux/\": platform specifier component must match \"^[A-Za-z0-9_-]+$\": invalid argument (did you mean MY_ARCH?)",
+		BuildErrLocation:  4,
 	})
 
 	dockerfile = []byte(`
@@ -408,8 +854,9 @@ COPY Dockerfile .
 		Dockerfile: dockerfile,
 		Warnings: []expectedLintWarning{
 			{
-				RuleName:    "UndeclaredArgInFrom",
+				RuleName:    "UndefinedArgInFrom",
 				Description: "FROM command must use declared ARGs",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/undefined-arg-in-from/",
 				Detail:      "FROM argument 'version' is not declared",
 				Level:       1,
 				Line:        3,
@@ -418,20 +865,444 @@ COPY Dockerfile .
 	})
 }
 
+func testWorkdirRelativePath(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`
+FROM scratch
+WORKDIR app/
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "WorkdirRelativePath",
+				Description: "Relative workdir without an absolute workdir declared within the build can have unexpected results if the base image changes",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/workdir-relative-path/",
+				Detail:      "Relative workdir \"app/\" can have unexpected results if the base image changes",
+				Level:       1,
+				Line:        3,
+			},
+		},
+	})
+
+	dockerfile = []byte(`
+FROM scratch AS a
+WORKDIR /app
+
+FROM a AS b
+WORKDIR subdir/
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
+}
+
+func testUnmatchedVars(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`
+FROM scratch
+ARG foo
+COPY Dockerfile${foo} .
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
+
+	dockerfile = []byte(`
+FROM alpine AS base
+ARG foo=Dockerfile
+
+FROM base
+COPY $foo .
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
+
+	dockerfile = []byte(`
+FROM alpine
+RUN echo $PATH
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
+
+	dockerfile = []byte(`
+FROM alpine
+COPY $foo .
+ARG foo=bar
+RUN echo $foo
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "UndefinedVar",
+				Description: "Variables should be defined before their use",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/undefined-var/",
+				Detail:      "Usage of undefined variable '$foo'",
+				Level:       1,
+				Line:        3,
+			},
+		},
+	})
+
+	dockerfile = []byte(`
+FROM alpine
+ARG DIR_BINARIES=binaries/
+ARG DIR_ASSETS=assets/
+ARG DIR_CONFIG=config/
+COPY $DIR_ASSET .
+	`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "UndefinedVar",
+				Description: "Variables should be defined before their use",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/undefined-var/",
+				Detail:      "Usage of undefined variable '$DIR_ASSET' (did you mean $DIR_ASSETS?)",
+				Level:       1,
+				Line:        6,
+			},
+		},
+	})
+
+	dockerfile = []byte(`
+FROM alpine
+ENV PATH=$PAHT:/tmp/bin
+		`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "UndefinedVar",
+				Description: "Variables should be defined before their use",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/undefined-var/",
+				Detail:      "Usage of undefined variable '$PAHT' (did you mean $PATH?)",
+				Level:       1,
+				Line:        3,
+			},
+		},
+	})
+}
+
+func testMultipleInstructionsDisallowed(t *testing.T, sb integration.Sandbox) {
+	makeLintWarning := func(instructionName string, line int) expectedLintWarning {
+		return expectedLintWarning{
+			RuleName:    "MultipleInstructionsDisallowed",
+			Description: "Multiple instructions of the same type should not be used in the same stage",
+			URL:         "https://docs.docker.com/go/dockerfile/rule/multiple-instructions-disallowed/",
+			Detail:      fmt.Sprintf("Multiple %s instructions should not be used in the same stage because only the last one will be used", instructionName),
+			Level:       1,
+			Line:        line,
+		}
+	}
+
+	dockerfile := []byte(`
+FROM scratch
+ENTRYPOINT ["/myapp"]
+ENTRYPOINT ["/myotherapp"]
+CMD ["/myapp"]
+CMD ["/myotherapp"]
+HEALTHCHECK CMD ["/myapp"]
+HEALTHCHECK CMD ["/myotherapp"]
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			makeLintWarning("ENTRYPOINT", 3),
+			makeLintWarning("CMD", 5),
+			makeLintWarning("HEALTHCHECK", 7),
+		},
+	})
+
+	// Still a linter warning even when broken up with another
+	// command. Entrypoint is only used by the resulting image.
+	dockerfile = []byte(`
+FROM scratch
+ENTRYPOINT ["/myapp"]
+CMD ["/myapp"]
+HEALTHCHECK CMD ["/myapp"]
+COPY <<EOF /a.txt
+Hello, World!
+EOF
+ENTRYPOINT ["/myotherapp"]
+CMD ["/myotherapp"]
+HEALTHCHECK CMD ["/myotherapp"]
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			makeLintWarning("ENTRYPOINT", 3),
+			makeLintWarning("CMD", 4),
+			makeLintWarning("HEALTHCHECK", 5),
+		},
+	})
+
+	dockerfile = []byte(`
+FROM scratch AS a
+ENTRYPOINT ["/myapp"]
+CMD ["/myapp"]
+HEALTHCHECK CMD ["/myapp"]
+
+FROM a AS b
+ENTRYPOINT ["/myotherapp"]
+CMD ["/myotherapp"]
+HEALTHCHECK CMD ["/myotherapp"]
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
+}
+
+func testLegacyKeyValueFormat(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`
+FROM scratch
+ENV testkey value
+LABEL key value
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "LegacyKeyValueFormat",
+				Description: "Legacy key/value format with whitespace separator should not be used",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/legacy-key-value-format/",
+				Detail:      "\"ENV key=value\" should be used instead of legacy \"ENV key value\" format",
+				Line:        3,
+				Level:       1,
+			},
+			{
+				RuleName:    "LegacyKeyValueFormat",
+				Description: "Legacy key/value format with whitespace separator should not be used",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/legacy-key-value-format/",
+				Detail:      "\"LABEL key=value\" should be used instead of legacy \"LABEL key value\" format",
+				Line:        4,
+				Level:       1,
+			},
+		},
+	})
+
+	dockerfile = []byte(`
+FROM scratch
+ENV testkey=value
+LABEL key=value
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{Dockerfile: dockerfile})
+
+	// Warnings only happen in unmarshal if the lint happens in a
+	// stage that's not reachable.
+	dockerfile = []byte(`
+FROM scratch AS a
+
+FROM a AS b
+ENV testkey value
+LABEL key value
+
+FROM a AS c
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		UnmarshalWarnings: []expectedLintWarning{
+			{
+				RuleName:    "LegacyKeyValueFormat",
+				Description: "Legacy key/value format with whitespace separator should not be used",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/legacy-key-value-format/",
+				Detail:      "\"ENV key=value\" should be used instead of legacy \"ENV key value\" format",
+				Line:        3,
+				Level:       1,
+			},
+			{
+				RuleName:    "LegacyKeyValueFormat",
+				Description: "Legacy key/value format with whitespace separator should not be used",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/legacy-key-value-format/",
+				Detail:      "\"LABEL key=value\" should be used instead of legacy \"LABEL key value\" format",
+				Line:        4,
+				Level:       1,
+			},
+		},
+	})
+}
+
+func testRedundantTargetPlatform(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`
+FROM --platform=$TARGETPLATFORM scratch
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "RedundantTargetPlatform",
+				Description: "Setting platform to predefined $TARGETPLATFORM in FROM is redundant as this is the default behavior",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/redundant-target-platform/",
+				Detail:      "Setting platform to predefined $TARGETPLATFORM in FROM is redundant as this is the default behavior",
+				Line:        2,
+				Level:       1,
+			},
+		},
+	})
+
+	dockerfile = []byte(`
+FROM --platform=${TARGETPLATFORM} scratch
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "RedundantTargetPlatform",
+				Description: "Setting platform to predefined $TARGETPLATFORM in FROM is redundant as this is the default behavior",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/redundant-target-platform/",
+				Detail:      "Setting platform to predefined ${TARGETPLATFORM} in FROM is redundant as this is the default behavior",
+				Line:        2,
+				Level:       1,
+			},
+		},
+	})
+}
+
+func testInvalidDefaultArgInFrom(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`
+ARG VERSION
+FROM busybox:$VERSION
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		FrontendAttrs: map[string]string{
+			"build-arg:VERSION": "latest",
+		},
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "InvalidDefaultArgInFrom",
+				Description: "Default value for global ARG results in an empty or invalid base image name",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/invalid-default-arg-in-from/",
+				Detail:      "Default value for ARG busybox:$VERSION results in empty or invalid base image name",
+				Line:        3,
+				Level:       1,
+			},
+		},
+	})
+
+	dockerfile = []byte(`
+ARG IMAGE
+FROM $IMAGE
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		FrontendAttrs: map[string]string{
+			"build-arg:IMAGE": "busybox:latest",
+		},
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "InvalidDefaultArgInFrom",
+				Description: "Default value for global ARG results in an empty or invalid base image name",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/invalid-default-arg-in-from/",
+				Detail:      "Default value for ARG $IMAGE results in empty or invalid base image name",
+				Line:        3,
+				Level:       1,
+			},
+		},
+	})
+
+	dockerfile = []byte(`
+ARG SFX="box:"
+FROM busy${SFX}
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		FrontendAttrs: map[string]string{
+			"build-arg:SFX": "box:latest",
+		},
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "InvalidDefaultArgInFrom",
+				Description: "Default value for global ARG results in an empty or invalid base image name",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/invalid-default-arg-in-from/",
+				Detail:      "Default value for ARG busy${SFX} results in empty or invalid base image name",
+				Line:        3,
+				Level:       1,
+			},
+		},
+	})
+
+	dockerfile = []byte(`
+ARG VERSION="latest"
+FROM busybox:${VERSION}
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		FrontendAttrs: map[string]string{
+			"build-arg:VERSION": "latest",
+		},
+	})
+
+	dockerfile = []byte(`
+ARG BUSYBOX_VARIANT=""
+FROM busybox:stable${BUSYBOX_VARIANT}
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		FrontendAttrs: map[string]string{
+			"build-arg:BUSYBOX_VARIANT": "-musl",
+		},
+	})
+
+	dockerfile = []byte(`
+ARG BUSYBOX_VARIANT
+FROM busybox:stable${BUSYBOX_VARIANT}
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		FrontendAttrs: map[string]string{
+			"build-arg:BUSYBOX_VARIANT": "-musl",
+		},
+	})
+}
+
+func testFromPlatformFlagConstDisallowed(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`
+FROM --platform=linux/amd64 scratch
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "FromPlatformFlagConstDisallowed",
+				Description: "FROM --platform flag should not use a constant value",
+				URL:         "https://docs.docker.com/go/dockerfile/rule/from-platform-flag-const-disallowed/",
+				Detail:      "FROM --platform flag should not use constant value \"linux/amd64\"",
+				Line:        2,
+				Level:       1,
+			},
+		},
+	})
+
+	dockerfile = []byte(`
+FROM --platform=linux/amd64 scratch AS my_amd64_stage
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+	})
+
+	dockerfile = []byte(`
+FROM --platform=linux/amd64 scratch AS linux
+`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+	})
+}
+
 func checkUnmarshal(t *testing.T, sb integration.Sandbox, lintTest *lintTestParams) {
 	destDir, err := os.MkdirTemp("", "buildkit")
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
+	var warnings []expectedLintWarning
+	if lintTest.UnmarshalWarnings != nil {
+		warnings = lintTest.UnmarshalWarnings
+	} else {
+		warnings = lintTest.Warnings
+	}
+
 	called := false
 	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		frontendOpts := map[string]string{
+			"frontend.caps": "moby.buildkit.frontend.subrequests",
+			"requestid":     "frontend.lint",
+		}
+		maps.Copy(frontendOpts, lintTest.FrontendAttrs)
+
 		res, err := c.Solve(ctx, gateway.SolveRequest{
-			FrontendOpt: map[string]string{
-				"frontend.caps": "moby.buildkit.frontend.subrequests",
-				"requestid":     "frontend.lint",
-				"build-arg:BAR": "678",
-			},
-			Frontend: "dockerfile.v0",
+			FrontendOpt: frontendOpts,
+			Frontend:    "dockerfile.v0",
 		})
 		if err != nil {
 			return nil, err
@@ -440,13 +1311,21 @@ func checkUnmarshal(t *testing.T, sb integration.Sandbox, lintTest *lintTestPara
 		lintResults, err := unmarshalLintResults(res)
 		require.NoError(t, err)
 
-		if lintResults.Error != nil {
-			require.Equal(t, lintTest.UnmarshalBuildErr, lintResults.Error.Message)
-			require.Equal(t, lintTest.BuildErrLocation, lintResults.Error.Location.Ranges[0].Start.Line)
+		if lintTest.UnmarshalBuildErr == "" && lintTest.UnmarshalBuildErrRegexp == nil {
+			require.Nil(t, lintResults.Error)
+		} else {
+			require.NotNil(t, lintResults.Error)
+			if lintTest.UnmarshalBuildErr != "" {
+				require.Equal(t, lintTest.UnmarshalBuildErr, lintResults.Error.Message)
+			} else if !lintTest.UnmarshalBuildErrRegexp.MatchString(lintResults.Error.Message) {
+				t.Fatalf("error %q does not match %q", lintResults.Error.Message, lintTest.UnmarshalBuildErrRegexp.String())
+			}
 			require.Greater(t, lintResults.Error.Location.SourceIndex, int32(-1))
 			require.Less(t, lintResults.Error.Location.SourceIndex, int32(len(lintResults.Sources)))
 		}
-		require.Equal(t, len(lintTest.Warnings), len(lintResults.Warnings))
+
+		require.Equal(t, len(warnings), len(lintResults.Warnings))
+
 		sort.Slice(lintResults.Warnings, func(i, j int) bool {
 			// sort by line number in ascending order
 			firstRange := lintResults.Warnings[i].Location.Ranges[0]
@@ -455,7 +1334,7 @@ func checkUnmarshal(t *testing.T, sb integration.Sandbox, lintTest *lintTestPara
 		})
 		// Compare expectedLintWarning with actual lint results
 		for i, w := range lintResults.Warnings {
-			checkLintWarning(t, w, lintTest.Warnings[i])
+			checkLintWarning(t, w, warnings[i])
 		}
 		called = true
 		return nil, nil
@@ -464,6 +1343,7 @@ func checkUnmarshal(t *testing.T, sb integration.Sandbox, lintTest *lintTestPara
 	_, err = lintTest.Client.Build(sb.Context(), client.SolveOpt{
 		LocalMounts: map[string]fsutil.FS{
 			dockerui.DefaultLocalNameDockerfile: lintTest.TmpDir,
+			dockerui.DefaultLocalNameContext:    lintTest.TmpDir,
 		},
 	}, "", frontend, nil)
 	require.NoError(t, err)
@@ -496,19 +1376,28 @@ func checkProgressStream(t *testing.T, sb integration.Sandbox, lintTest *lintTes
 
 	f := getFrontend(t, sb)
 
-	_, err := f.Solve(sb.Context(), lintTest.Client, client.SolveOpt{
-		FrontendAttrs: map[string]string{
+	attrs := lintTest.FrontendAttrs
+	if attrs == nil {
+		attrs = map[string]string{
 			"platform": "linux/amd64,linux/arm64",
-		},
+		}
+	}
+
+	_, err := f.Solve(sb.Context(), lintTest.Client, client.SolveOpt{
+		FrontendAttrs: attrs,
 		LocalMounts: map[string]fsutil.FS{
 			dockerui.DefaultLocalNameDockerfile: lintTest.TmpDir,
 			dockerui.DefaultLocalNameContext:    lintTest.TmpDir,
 		},
 	}, status)
-	if lintTest.StreamBuildErr == "" {
+	if lintTest.StreamBuildErr == "" && lintTest.StreamBuildErrRegexp == nil {
 		require.NoError(t, err)
 	} else {
-		require.EqualError(t, err, lintTest.StreamBuildErr)
+		if lintTest.StreamBuildErr != "" {
+			require.EqualError(t, err, lintTest.StreamBuildErr)
+		} else if !lintTest.StreamBuildErrRegexp.MatchString(err.Error()) {
+			t.Fatalf("error %q does not match %q", err.Error(), lintTest.StreamBuildErrRegexp.String())
+		}
 	}
 
 	select {
@@ -517,7 +1406,6 @@ func checkProgressStream(t *testing.T, sb integration.Sandbox, lintTest *lintTes
 		t.Fatalf("timed out waiting for statusDone")
 	}
 
-	// two platforms only show one warning
 	require.Equal(t, len(lintTest.Warnings), len(warnings))
 	sort.Slice(warnings, func(i, j int) bool {
 		w1 := warnings[i]
@@ -543,9 +1431,15 @@ func checkLinterWarnings(t *testing.T, sb integration.Sandbox, lintTest *lintTes
 	integration.SkipOnPlatform(t, "windows")
 
 	if lintTest.TmpDir == nil {
+		testfiles := []fstest.Applier{
+			fstest.CreateFile("Dockerfile", lintTest.Dockerfile, 0600),
+		}
+		if lintTest.DockerIgnore != nil {
+			testfiles = append(testfiles, fstest.CreateFile(".dockerignore", lintTest.DockerIgnore, 0600))
+		}
 		lintTest.TmpDir = integration.Tmpdir(
 			t,
-			fstest.CreateFile("Dockerfile", lintTest.Dockerfile, 0600),
+			testfiles...,
 		)
 	}
 
@@ -604,11 +1498,16 @@ type expectedLintWarning struct {
 }
 
 type lintTestParams struct {
-	Client            *client.Client
-	TmpDir            *integration.TmpDirWithName
-	Dockerfile        []byte
-	Warnings          []expectedLintWarning
-	StreamBuildErr    string
-	UnmarshalBuildErr string
-	BuildErrLocation  int32
+	Client                  *client.Client
+	TmpDir                  *integration.TmpDirWithName
+	Dockerfile              []byte
+	DockerIgnore            []byte
+	Warnings                []expectedLintWarning
+	UnmarshalWarnings       []expectedLintWarning
+	StreamBuildErr          string
+	StreamBuildErrRegexp    *regexp.Regexp
+	UnmarshalBuildErr       string
+	UnmarshalBuildErrRegexp *regexp.Regexp
+	BuildErrLocation        int32
+	FrontendAttrs           map[string]string
 }

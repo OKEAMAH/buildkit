@@ -22,17 +22,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gogo/googleapis/google/rpc"
 	v1 "github.com/moby/buildkit/cache/remotecache/v1"
 	"github.com/tonistiigi/fsutil"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/content/local"
+	"github.com/containerd/containerd/content/proxy"
 	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/continuity/fs/fstest"
+	"github.com/containerd/platforms"
 	intoto "github.com/in-toto/in-toto-golang/in_toto"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/client"
@@ -49,6 +53,8 @@ import (
 	"github.com/moby/buildkit/solver/pb"
 	spb "github.com/moby/buildkit/sourcepolicy/pb"
 	"github.com/moby/buildkit/util/contentutil"
+	"github.com/moby/buildkit/util/grpcerrors"
+	"github.com/moby/buildkit/util/stack"
 	"github.com/moby/buildkit/util/testutil"
 	"github.com/moby/buildkit/util/testutil/httpserver"
 	"github.com/moby/buildkit/util/testutil/integration"
@@ -56,7 +62,9 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	statuspb "google.golang.org/genproto/googleapis/rpc/status"
 )
 
 func init() {
@@ -101,6 +109,8 @@ var allTests = integration.TestFuncs(
 	testPlatformArgsExplicit,
 	testExportMultiPlatform,
 	testQuotedMetaArgs,
+	testGlobalArgErrors,
+	testArgDefaultExpansion,
 	testIgnoreEntrypoint,
 	testSymlinkedDockerfile,
 	testEmptyWildcard,
@@ -120,7 +130,7 @@ var allTests = integration.TestFuncs(
 	testErrorsSourceMap,
 	testMultiArgs,
 	testFrontendSubrequests,
-	testDockefileCheckHostname,
+	testDockerfileCheckHostname,
 	testDefaultShellAndPath,
 	testDockerfileLowercase,
 	testExportCacheLoop,
@@ -140,6 +150,8 @@ var allTests = integration.TestFuncs(
 	testNamedMultiplatformInputContext,
 	testNamedFilteredContext,
 	testEmptyDestDir,
+	testCopyLinkDotDestDir,
+	testCopyLinkEmptyDestDir,
 	testCopyChownCreateDest,
 	testCopyThroughSymlinkContext,
 	testCopyThroughSymlinkMultiStage,
@@ -149,11 +161,13 @@ var allTests = integration.TestFuncs(
 	testCopySymlinks,
 	testCopyChown,
 	testCopyChmod,
+	testCopyInvalidChmod,
 	testCopyOverrideFiles,
 	testCopyVarSubstitution,
 	testCopyWildcards,
 	testCopyRelative,
 	testAddURLChmod,
+	testAddInvalidChmod,
 	testTarContext,
 	testTarContextExternalDockerfile,
 	testWorkdirUser,
@@ -181,6 +195,12 @@ var allTests = integration.TestFuncs(
 	testFrontendDeduplicateSources,
 	testDuplicateLayersProvenance,
 	testSourcePolicyWithNamedContext,
+	testEmptyStringArgInEnv,
+	testInvalidJSONCommands,
+	testHistoryError,
+	testHistoryFinalizeTrace,
+	testEmptyStages,
+	testLocalCustomSessionID,
 )
 
 // Tests that depend on the `security.*` entitlements
@@ -197,8 +217,10 @@ var reproTests = integration.TestFuncs(
 	testReproSourceDateEpoch,
 )
 
-var opts []integration.TestOpt
-var securityOpts []integration.TestOpt
+var (
+	opts         []integration.TestOpt
+	securityOpts []integration.TestOpt
+)
 
 type frontend interface {
 	Solve(context.Context, *client.Client, client.SolveOpt, chan *client.SolveStatus) (*client.SolveResponse, error)
@@ -210,8 +232,11 @@ type frontend interface {
 func init() {
 	frontends := map[string]interface{}{}
 
+	images := integration.UnixOrWindows(
+		[]string{"busybox:latest", "alpine:latest"},
+		[]string{"nanoserver:latest", "nanoserver:plus"})
 	opts = []integration.TestOpt{
-		integration.WithMirroredImages(integration.OfficialImages("busybox:latest", "alpine:latest")),
+		integration.WithMirroredImages(integration.OfficialImages(images...)),
 		integration.WithMatrix("frontend", frontends),
 	}
 
@@ -234,27 +259,76 @@ func init() {
 func TestIntegration(t *testing.T) {
 	integration.Run(t, allTests, opts...)
 
-	integration.Run(t, securityTests, append(append(opts, securityOpts...),
-		integration.WithMatrix("security.insecure", map[string]interface{}{
-			"granted": securityInsecureGranted,
-			"denied":  securityInsecureDenied,
-		}))...)
-	integration.Run(t, networkTests, append(opts,
-		integration.WithMatrix("network.host", map[string]interface{}{
-			"granted": networkHostGranted,
-			"denied":  networkHostDenied,
-		}))...)
 	integration.Run(t, lintTests, opts...)
 	integration.Run(t, heredocTests, opts...)
 	integration.Run(t, outlineTests, opts...)
 	integration.Run(t, targetsTests, opts...)
 
+	// the rest of the tests are meant for non-Windows, skipping on Windows.
+	integration.SkipOnPlatform(t, "windows")
+
 	integration.Run(t, reproTests, append(opts,
 		// Only use the amd64 digest,  regardless to the host platform
 		integration.WithMirroredImages(map[string]string{
-			"amd64/bullseye-20230109-slim": "docker.io/amd64/debian:bullseye-20230109-slim@sha256:1acb06a0c31fb467eb8327ad361f1091ab265e0bf26d452dea45dcb0c0ea5e75",
+			"amd64/bullseye-20230109-slim:latest": "docker.io/amd64/debian:bullseye-20230109-slim@sha256:1acb06a0c31fb467eb8327ad361f1091ab265e0bf26d452dea45dcb0c0ea5e75",
 		}),
 	)...)
+
+	integration.Run(t, securityTests, append(append(opts, securityOpts...),
+		integration.WithMatrix("security.insecure", map[string]interface{}{
+			"granted": securityInsecureGranted,
+			"denied":  securityInsecureDenied,
+		}))...)
+
+	integration.Run(t, networkTests, append(opts,
+		integration.WithMatrix("network.host", map[string]interface{}{
+			"granted": networkHostGranted,
+			"denied":  networkHostDenied,
+		}))...)
+}
+
+func testEmptyStringArgInEnv(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`
+FROM busybox AS build
+ARG FOO
+ARG BAR=
+RUN env > env.txt
+
+FROM scratch
+COPY --from=build env.txt .
+`)
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	destDir := t.TempDir()
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		Exports: []client.ExportEntry{
+			{
+				Type:      client.ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	dt, err := os.ReadFile(filepath.Join(destDir, "env.txt"))
+	require.NoError(t, err)
+
+	envStr := string(dt)
+	require.Contains(t, envStr, "BAR=")
+	require.NotContains(t, envStr, "FOO=")
 }
 
 func testDefaultEnvWithArgs(t *testing.T, sb integration.Sandbox) {
@@ -323,14 +397,20 @@ echo -n $my_arg $* > /out
 }
 
 func testEnvEmptyFormatting(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
-	dockerfile := []byte(`
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
 FROM busybox AS build
 ENV myenv foo%sbar
 RUN [ "$myenv" = 'foo%sbar' ]
-`)
+`,
+		`
+FROM nanoserver AS build
+ENV myenv foo%sbar
+RUN if %myenv% NEQ foo%sbar (exit 1)
+`,
+	))
 
 	dir := integration.Tmpdir(
 		t,
@@ -359,23 +439,36 @@ RUN [ "$myenv" = 'foo%sbar' ]
 }
 
 func testDockerignoreOverride(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
-	dockerfile := []byte(`
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
 FROM busybox
 COPY . .
 RUN [ -f foo ] && [ ! -f bar ]
-`)
+`,
+		`
+FROM nanoserver
+COPY . .
+RUN if exist foo (if not exist bar (exit 0) else (exit 1))
+`,
+	))
 
 	ignore := []byte(`
 bar
 `)
 
-	dockerfile2 := []byte(`
+	dockerfile2 := []byte(integration.UnixOrWindows(
+		`
 FROM busybox
 COPY . .
 RUN [ ! -f foo ] && [ -f bar ]
-`)
+`,
+		`
+FROM nanoserver
+COPY . .
+RUN if not exist foo (if exist bar (exit 0) else (exit 1))
+`,
+	))
 
 	ignore2 := []byte(`
 foo
@@ -416,13 +509,81 @@ foo
 }
 
 func testEmptyDestDir(t *testing.T, sb integration.Sandbox) {
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
+FROM busybox
+ENV empty=""
+COPY testfile $empty
+RUN [ "$(cat testfile)" == "contents0" ]
+`,
+		`
+FROM nanoserver
+COPY testfile ''
+RUN cmd /V:on /C "set /p tfcontent=<testfile \
+	& if !tfcontent! NEQ contents0 (exit 1)"
+`,
+	))
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("testfile", []byte("contents0"), 0600),
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.NoError(t, err)
+}
+
+func testCopyLinkDotDestDir(t *testing.T, sb integration.Sandbox) {
 	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
 FROM busybox
+WORKDIR /var/www
+COPY --link testfile .
+RUN [ "$(cat testfile)" == "contents0" ]
+`)
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("testfile", []byte("contents0"), 0600),
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.NoError(t, err)
+}
+
+func testCopyLinkEmptyDestDir(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`
+FROM busybox
+WORKDIR /var/www
 ENV empty=""
-COPY testfile $empty
+COPY --link testfile $empty
 RUN [ "$(cat testfile)" == "contents0" ]
 `)
 
@@ -1216,7 +1377,7 @@ COPY . /
 	fi, err := os.Lstat(filepath.Join(destDir, "socket.sock"))
 	require.NoError(t, err)
 	// make sure socket is converted to regular file.
-	require.Equal(t, fi.Mode().IsRegular(), true)
+	require.Equal(t, true, fi.Mode().IsRegular())
 }
 
 func testIgnoreEntrypoint(t *testing.T, sb integration.Sandbox) {
@@ -1290,6 +1451,98 @@ COPY --from=build /out .
 	dt, err := os.ReadFile(filepath.Join(destDir, "out"))
 	require.NoError(t, err)
 	require.Equal(t, "bar-box-foo", string(dt))
+}
+
+func testGlobalArgErrors(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`
+ARG FOO=${FOO:?"custom error"}
+FROM busybox
+`)
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.Error(t, err)
+
+	require.Contains(t, err.Error(), "FOO: custom error")
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		FrontendAttrs: map[string]string{
+			"build-arg:FOO": "bar",
+		},
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.NoError(t, err)
+}
+
+func testArgDefaultExpansion(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`
+FROM scratch
+ARG FOO
+ARG BAR=${FOO:?"foo missing"}
+`)
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.Error(t, err)
+
+	require.Contains(t, err.Error(), "FOO: foo missing")
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		FrontendAttrs: map[string]string{
+			"build-arg:FOO": "123",
+		},
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		FrontendAttrs: map[string]string{
+			"build-arg:BAR": "123",
+		},
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.NoError(t, err)
 }
 
 func testMultiArgs(t *testing.T, sb integration.Sandbox) {
@@ -1894,6 +2147,84 @@ ENTRYPOINT my entrypoint
 	require.Equal(t, []string{"ls", "my entrypoint"}, ociimg.Config.Entrypoint)
 }
 
+func testInvalidJSONCommands(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`
+FROM alpine
+RUN ["echo", "hello"]this is invalid
+`)
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "this is invalid")
+
+	workers.CheckFeatureCompat(t, sb,
+		workers.FeatureDirectPush,
+	)
+
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+
+	target := registry + "/buildkit/testexportdf:multi"
+
+	dockerfile = []byte(`
+FROM alpine
+ENTRYPOINT []random string
+`)
+
+	dir = integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		Exports: []client.ExportEntry{
+			{
+				Type: client.ExporterImage,
+				Attrs: map[string]string{
+					"name": target,
+					"push": "true",
+				},
+			},
+		},
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	desc, provider, err := contentutil.ProviderFromRef(target)
+	require.NoError(t, err)
+
+	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
+	require.NoError(t, err)
+
+	require.Len(t, imgs.Images, 1)
+	img := imgs.Images[0].Img
+
+	require.Equal(t, []string{"/bin/sh", "-c", "[]random string"}, img.Config.Entrypoint)
+}
+
 func testPullScratch(t *testing.T, sb integration.Sandbox) {
 	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
@@ -2050,31 +2381,47 @@ FROM busybox:${tag}
 }
 
 func testDockerfileDirs(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 	f.RequiresBuildctl(t)
 
-	dockerfile := []byte(`
-	FROM busybox
-	COPY foo /foo2
-	COPY foo /
-	RUN echo -n bar > foo3
-	RUN test -f foo
-	RUN cmp -s foo foo2
-	RUN cmp -s foo foo3
-`)
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
+FROM busybox
+COPY foo /foo2
+COPY foo /
+RUN echo -n bar > foo3
+RUN test -f foo
+RUN cmp -s foo foo2
+RUN cmp -s foo foo3
+`,
+		`
+FROM nanoserver:plus
+USER ContainerAdministrator
+COPY foo /foo2
+COPY foo /
+RUN echo bar> foo3
+RUN IF EXIST foo (exit 0) ELSE (exit 1)
+RUN fc /b foo foo2 && (exit 0) || (exit 1)
+RUN fc /b foo foo3 && (exit 0) || (exit 1)
+`,
+	))
+
+	bar := integration.UnixOrWindows(`bar`, "bar\r\n")
 
 	dir := integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
-		fstest.CreateFile("foo", []byte("bar"), 0600),
+		fstest.CreateFile("foo", []byte(bar), 0600),
 	)
 
 	args, trace := f.DFCmdArgs(dir.Name, dir.Name)
 	defer os.RemoveAll(trace)
 
 	cmd := sb.Cmd(args)
-	require.NoError(t, cmd.Run())
+	stdout := new(bytes.Buffer)
+	cmd.Stderr = stdout
+	err1 := cmd.Run()
+	require.NoError(t, err1)
 
 	_, err := os.Stat(trace)
 	require.NoError(t, err)
@@ -2085,7 +2432,10 @@ func testDockerfileDirs(t *testing.T, sb integration.Sandbox) {
 
 	cmd = sb.Cmd(args)
 	cmd.Dir = dir.Name
-	require.NoError(t, cmd.Run())
+	stdout.Reset()
+	cmd.Stderr = stdout
+	err2 := cmd.Run()
+	require.NoError(t, err2)
 
 	_, err = os.Stat(trace)
 	require.NoError(t, err)
@@ -2098,7 +2448,7 @@ func testDockerfileDirs(t *testing.T, sb integration.Sandbox) {
 
 	dir2 := integration.Tmpdir(
 		t,
-		fstest.CreateFile("foo", []byte("bar"), 0600),
+		fstest.CreateFile("foo", []byte(bar), 0600),
 	)
 
 	args, trace = f.DFCmdArgs(dir2.Name, dir1.Name)
@@ -2116,13 +2466,18 @@ func testDockerfileDirs(t *testing.T, sb integration.Sandbox) {
 }
 
 func testDockerfileInvalidCommand(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 	f.RequiresBuildctl(t)
-	dockerfile := []byte(`
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
 	FROM busybox
 	RUN invalidcmd
-`)
+`,
+		`
+	FROM nanoserver
+	RUN invalidcmd
+`,
+	))
 
 	dir := integration.Tmpdir(
 		t,
@@ -2137,8 +2492,14 @@ func testDockerfileInvalidCommand(t *testing.T, sb integration.Sandbox) {
 	cmd.Stderr = stdout
 	err := cmd.Run()
 	require.Error(t, err)
-	require.Contains(t, stdout.String(), "/bin/sh -c invalidcmd")
-	require.Contains(t, stdout.String(), "did not complete successfully")
+	require.Contains(t, stdout.String(), integration.UnixOrWindows(
+		"/bin/sh -c invalidcmd",
+		"cmd /S /C invalidcmd",
+	))
+	require.Contains(t, stdout.String(), integration.UnixOrWindows(
+		"did not complete successfully",
+		"'invalidcmd' is not recognized as an internal or external command",
+	))
 }
 
 func testDockerfileInvalidInstruction(t *testing.T, sb integration.Sandbox) {
@@ -3173,9 +3534,13 @@ COPY --chmod=0644 foo /
 COPY --chmod=777 bar /baz
 COPY --chmod=0 foo /foobis
 
+ARG mode
+COPY --chmod=${mode} foo /footer
+
 RUN stat -c "%04a" /foo  > /out/fooperm
 RUN stat -c "%04a" /baz  > /out/barperm
 RUN stat -c "%04a" /foobis  > /out/foobisperm
+RUN stat -c "%04a" /footer  > /out/footerperm
 FROM scratch
 COPY --from=base /out /
 `)
@@ -3200,6 +3565,9 @@ COPY --from=base /out /
 				OutputDir: destDir,
 			},
 		},
+		FrontendAttrs: map[string]string{
+			"build-arg:mode": "755",
+		},
 		LocalMounts: map[string]fsutil.FS{
 			dockerui.DefaultLocalNameDockerfile: dir,
 			dockerui.DefaultLocalNameContext:    dir,
@@ -3219,6 +3587,61 @@ COPY --from=base /out /
 	dt, err = os.ReadFile(filepath.Join(destDir, "foobisperm"))
 	require.NoError(t, err)
 	require.Equal(t, "0000\n", string(dt))
+
+	dt, err = os.ReadFile(filepath.Join(destDir, "footerperm"))
+	require.NoError(t, err)
+	require.Equal(t, "0755\n", string(dt))
+}
+
+func testCopyInvalidChmod(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`
+FROM scratch
+COPY --chmod=64a foo /
+`)
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("foo", []byte(`foo-contents`), 0600),
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.ErrorContains(t, err, "invalid chmod parameter: '64a'. it should be octal string and between 0 and 07777")
+
+	dockerfile = []byte(`
+FROM scratch
+COPY --chmod=10000 foo /
+`)
+
+	dir = integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("foo", []byte(`foo-contents`), 0600),
+	)
+
+	c, err = client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.ErrorContains(t, err, "invalid chmod parameter: '10000'. it should be octal string and between 0 and 07777")
 }
 
 func testCopyOverrideFiles(t *testing.T, sb integration.Sandbox) {
@@ -3405,10 +3828,10 @@ COPY sub/dir1 subdest6
 }
 
 func testCopyRelative(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
-	dockerfile := []byte(`
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
 FROM busybox
 WORKDIR /test1
 WORKDIR test2
@@ -3430,7 +3853,32 @@ RUN sh -c "[ $(cat /test4/foo) = 'hello' ]"
 WORKDIR /test5/test6
 COPY foo ../
 RUN sh -c "[ $(cat /test5/foo) = 'hello' ]"
-`)
+`,
+		`
+FROM nanoserver
+WORKDIR /test1
+WORKDIR test2
+RUN if %CD% NEQ C:\test1\test2 (exit 1)
+COPY foo ./
+RUN for /f %i in ('type \test1\test2\foo') do (if %i NEQ hello (exit 1))
+ADD foo ./bar/baz
+RUN for /f %i in ('type \test1\test2\bar\baz') do (if %i NEQ hello (exit 1))
+COPY foo ./bar/baz2
+RUN for /f %i in ('type \test1\test2\bar\baz2') do (if %i NEQ hello (exit 1))
+WORKDIR ..
+COPY foo ./
+RUN for /f %i in ('type \test1\foo') do (if %i NEQ hello (exit 1))
+# COPY foo /test3/ # TODO -> https://github.com/moby/buildkit/issues/5249
+COPY foo /test3/foo
+RUN for /f %i in ('type \test3\foo') do (if %i == hello (exit 0) else (exit 1))
+WORKDIR /test4
+COPY . .
+RUN for /f %i in ('type \test4\foo') do (if %i NEQ hello (exit 1))
+WORKDIR /test5/test6
+COPY foo ../
+RUN for /f %i in ('type \test5\foo') do (if %i NEQ hello (exit 1))
+`,
+	))
 
 	dir := integration.Tmpdir(
 		t,
@@ -3470,9 +3918,14 @@ FROM busybox AS build
 ADD --chmod=644 %[1]s /tmp/foo1
 ADD --chmod=755 %[1]s /tmp/foo2
 ADD --chmod=0413 %[1]s /tmp/foo3
+
+ARG mode
+ADD --chmod=${mode} %[1]s /tmp/foo4
+
 RUN stat -c "%%04a" /tmp/foo1 >> /dest && \
 	stat -c "%%04a" /tmp/foo2 >> /dest && \
-	stat -c "%%04a" /tmp/foo3 >> /dest
+	stat -c "%%04a" /tmp/foo3 >> /dest && \
+	stat -c "%%04a" /tmp/foo4 >> /dest
 
 FROM scratch
 COPY --from=build /dest /dest
@@ -3496,6 +3949,9 @@ COPY --from=build /dest /dest
 				OutputDir: destDir,
 			},
 		},
+		FrontendAttrs: map[string]string{
+			"build-arg:mode": "400",
+		},
 		LocalMounts: map[string]fsutil.FS{
 			dockerui.DefaultLocalNameDockerfile: dir,
 			dockerui.DefaultLocalNameContext:    dir,
@@ -3505,7 +3961,58 @@ COPY --from=build /dest /dest
 
 	dt, err := os.ReadFile(filepath.Join(destDir, "dest"))
 	require.NoError(t, err)
-	require.Equal(t, []byte("0644\n0755\n0413\n"), dt)
+	require.Equal(t, []byte("0644\n0755\n0413\n0400\n"), dt)
+}
+
+func testAddInvalidChmod(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`
+FROM scratch
+ADD --chmod=64a foo /
+`)
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("foo", []byte(`foo-contents`), 0600),
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.ErrorContains(t, err, "invalid chmod parameter: '64a'. it should be octal string and between 0 and 07777")
+
+	dockerfile = []byte(`
+FROM scratch
+ADD --chmod=10000 foo /
+`)
+
+	dir = integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("foo", []byte(`foo-contents`), 0600),
+	)
+
+	c, err = client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.ErrorContains(t, err, "invalid chmod parameter: '10000'. it should be octal string and between 0 and 07777")
 }
 
 func testDockerfileFromGit(t *testing.T, sb integration.Sandbox) {
@@ -3548,7 +4055,7 @@ COPY --from=build foo bar2
 	)
 	require.NoError(t, err)
 
-	server := httptest.NewServer(http.FileServer(http.Dir(filepath.Join(gitDir))))
+	server := httptest.NewServer(http.FileServer(http.Dir(filepath.Clean(gitDir))))
 	defer server.Close()
 
 	destDir := t.TempDir()
@@ -4230,6 +4737,7 @@ COPY --from=base unique /
 	require.NoError(t, err)
 	require.Equal(t, string(dt), string(dt2))
 }
+
 func testCacheImportExport(t *testing.T, sb integration.Sandbox) {
 	integration.SkipOnPlatform(t, "windows")
 	workers.CheckFeatureCompat(t, sb, workers.FeatureCacheExport, workers.FeatureCacheBackendLocal)
@@ -4803,7 +5311,7 @@ COPY foo /
 	defer c.Close()
 
 	up := uploadprovider.New()
-	url := up.Add(buf)
+	url := up.Add(io.NopCloser(buf))
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
@@ -4848,7 +5356,7 @@ COPY foo bar
 	defer c.Close()
 
 	up := uploadprovider.New()
-	url := up.Add(buf)
+	url := up.Add(io.NopCloser(buf))
 
 	// repeat with changed default args should match the old cache
 	destDir := t.TempDir()
@@ -4874,7 +5382,7 @@ COPY foo bar
 
 	dt, err := os.ReadFile(filepath.Join(destDir, "bar"))
 	require.NoError(t, err)
-	require.Equal(t, string(dt), "contents")
+	require.Equal(t, "contents", string(dt))
 }
 
 func testFrontendUseForwardedSolveResults(t *testing.T, sb integration.Sandbox) {
@@ -5075,7 +5583,7 @@ COPY Dockerfile Dockerfile
 		reqs, err := subrequests.Describe(ctx, c)
 		require.NoError(t, err)
 
-		require.True(t, len(reqs) > 0)
+		require.Greater(t, len(reqs), 0)
 
 		hasDescribe := false
 
@@ -5083,8 +5591,8 @@ COPY Dockerfile Dockerfile
 			if req.Name == "frontend.subrequests.describe" {
 				hasDescribe = true
 				require.Equal(t, subrequests.RequestType("rpc"), req.Type)
-				require.NotEqual(t, req.Version, "")
-				require.True(t, len(req.Metadata) > 0)
+				require.NotEqual(t, "", req.Version)
+				require.Greater(t, len(req.Metadata), 0)
 				require.Equal(t, "result.json", req.Metadata[0].Name)
 			}
 		}
@@ -5128,7 +5636,7 @@ COPY Dockerfile Dockerfile
 }
 
 // moby/buildkit#1301
-func testDockefileCheckHostname(t *testing.T, sb integration.Sandbox) {
+func testDockerfileCheckHostname(t *testing.T, sb integration.Sandbox) {
 	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 	dockerfile := []byte(`
@@ -5184,6 +5692,40 @@ RUN echo $(hostname) | grep foo
 			require.NoError(t, err)
 		})
 	}
+}
+
+func testEmptyStages(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+	f := getFrontend(t, sb)
+	dockerfile := []byte(`
+ARG foo=bar
+`)
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	destDir := t.TempDir()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+		Exports: []client.ExportEntry{
+			{
+				Type:      client.ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+	}, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "dockerfile contains no stages to build")
 }
 
 func testShmSize(t *testing.T, sb integration.Sandbox) {
@@ -5385,7 +5927,7 @@ COPY --from=base /out /
 
 	dt, err := os.ReadFile(filepath.Join(destDir, "out"))
 	require.NoError(t, err)
-	require.True(t, len(dt) > 0)
+	require.Greater(t, len(dt), 0)
 
 	workers.CheckFeatureCompat(t, sb, workers.FeatureDirectPush)
 
@@ -5464,7 +6006,7 @@ COPY --from=base /env_foobar /
 
 	dt, err = os.ReadFile(filepath.Join(destDir, "out"))
 	require.NoError(t, err)
-	require.True(t, len(dt) > 0)
+	require.Greater(t, len(dt), 0)
 
 	dt, err = os.ReadFile(filepath.Join(destDir, "env_foobar"))
 	require.NoError(t, err)
@@ -5686,19 +6228,26 @@ EOF
 }
 
 func testNamedLocalContext(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
 	ctx := sb.Context()
 
 	c, err := client.New(ctx, sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	dockerfile := []byte(`
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
 FROM busybox AS base
 RUN cat /etc/alpine-release > /out
 FROM scratch
 COPY --from=base /o* /
-`)
+`,
+		`
+FROM nanoserver AS base
+RUN type License.txt > /out
+FROM nanoserver
+COPY --from=base /o* /
+`,
+	))
 
 	dir := integration.Tmpdir(
 		t,
@@ -5738,11 +6287,91 @@ COPY --from=base /o* /
 
 	dt, err := os.ReadFile(filepath.Join(destDir, "out"))
 	require.NoError(t, err)
-	require.True(t, len(dt) > 0)
+	require.Greater(t, len(dt), 0)
 
 	_, err = os.ReadFile(filepath.Join(destDir, "out2"))
 	require.Error(t, err)
 	require.True(t, errors.Is(err, os.ErrNotExist))
+}
+
+func testLocalCustomSessionID(t *testing.T, sb integration.Sandbox) {
+	ctx := sb.Context()
+
+	c, err := client.New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
+FROM scratch AS base
+FROM scratch
+COPY out /out1
+COPY --from=base /another /out2
+`,
+		`
+FROM nanoserver AS base
+FROM nanoserver
+COPY out /out1
+COPY --from=base /another /out2
+`,
+	))
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	dir2 := integration.Tmpdir(
+		t,
+		fstest.CreateFile("out", []byte("contents1"), 0600),
+	)
+
+	dir3 := integration.Tmpdir(
+		t,
+		fstest.CreateFile("another", []byte("contents2"), 0600),
+	)
+
+	f := getFrontend(t, sb)
+
+	destDir := t.TempDir()
+
+	dirs := filesync.NewFSSyncProvider(filesync.StaticDirSource{
+		dockerui.DefaultLocalNameDockerfile: dir,
+		dockerui.DefaultLocalNameContext:    dir2,
+		"basedir":                           dir3,
+	})
+
+	s, err := session.NewSession(ctx, "hint")
+	require.NoError(t, err)
+	s.Allow(dirs)
+	go func() {
+		err := s.Run(ctx, c.Dialer())
+		assert.NoError(t, err)
+	}()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		FrontendAttrs: map[string]string{
+			"context:base": "local:basedir",
+			"local-sessionid:" + dockerui.DefaultLocalNameDockerfile: s.ID(),
+			"local-sessionid:" + dockerui.DefaultLocalNameContext:    s.ID(),
+			"local-sessionid:basedir":                                s.ID(),
+		},
+		Exports: []client.ExportEntry{
+			{
+				Type:      client.ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	dt, err := os.ReadFile(filepath.Join(destDir, "out1"))
+	require.NoError(t, err)
+	require.Equal(t, "contents1", string(dt))
+
+	dt, err = os.ReadFile(filepath.Join(destDir, "out2"))
+	require.NoError(t, err)
+	require.Equal(t, "contents2", string(dt))
 }
 
 func testNamedOCILayoutContext(t *testing.T, sb integration.Sandbox) {
@@ -5868,22 +6497,21 @@ COPY --from=imported /test/outfoo /
 
 	dt, err := os.ReadFile(filepath.Join(destDir, "out"))
 	require.NoError(t, err)
-	require.True(t, len(dt) > 0)
+	require.Greater(t, len(dt), 0)
 	require.Equal(t, []byte("first"), dt)
 
 	dt, err = os.ReadFile(filepath.Join(destDir, "out2"))
 	require.NoError(t, err)
-	require.True(t, len(dt) > 0)
+	require.Greater(t, len(dt), 0)
 	require.Equal(t, []byte("second"), dt)
 
 	dt, err = os.ReadFile(filepath.Join(destDir, "outfoo"))
 	require.NoError(t, err)
-	require.True(t, len(dt) > 0)
+	require.Greater(t, len(dt), 0)
 	require.Equal(t, []byte("bar"), dt)
 }
 
 func testNamedOCILayoutContextExport(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
 	workers.CheckFeatureCompat(t, sb, workers.FeatureOCIExporter, workers.FeatureOCILayout)
 	ctx := sb.Context()
 
@@ -5893,11 +6521,18 @@ func testNamedOCILayoutContextExport(t *testing.T, sb integration.Sandbox) {
 
 	ocidir := t.TempDir()
 
-	dockerfile := []byte(`
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
 FROM scratch
 WORKDIR /test
 ENV foo=bar
-	`)
+	`,
+		`
+FROM nanoserver
+WORKDIR /test
+ENV foo=bar
+	`,
+	))
 	dir := integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
@@ -5989,7 +6624,8 @@ FROM nonexistent AS base
 	var cfg ocispecs.Image
 	require.NoError(t, json.Unmarshal(m[ocispecs.ImageBlobsDir+"/sha256/"+digest].Data, &cfg))
 
-	require.Equal(t, "/test", cfg.Config.WorkingDir)
+	wd := integration.UnixOrWindows("/test", "\\test")
+	require.Equal(t, wd, cfg.Config.WorkingDir)
 	require.Contains(t, cfg.Config.Env, "foo=bar")
 }
 
@@ -6788,6 +7424,7 @@ func testReproSourceDateEpoch(t *testing.T, sb integration.Sandbox) {
 		dockerfile     string
 		files          []fstest.Applier
 		expectedDigest string
+		noCacheExport  bool
 	}
 	testCases := []testCase{
 		{
@@ -6814,6 +7451,14 @@ COPY --link foo foo
 `,
 			files:          []fstest.Applier{fstest.CreateFile("foo", []byte("foo"), 0600)},
 			expectedDigest: "sha256:9f75e4bdbf3d825acb36bb603ddef4a25742afb8ccb674763ffc611ae047d8a6",
+		},
+		{
+			// https://github.com/moby/buildkit/issues/4793
+			name: "NoAdditionalLayer",
+			dockerfile: `FROM amd64/debian:bullseye-20230109-slim
+`,
+			expectedDigest: "sha256:eeba8ef81dec46359d099c5d674009da54e088fa8f29945d4d7fb3a7a88c450e",
+			noCacheExport:  true, // "skipping cache export for empty result"
 		},
 	}
 
@@ -6874,7 +7519,10 @@ COPY --link foo foo
 			require.NoError(t, err)
 
 			desc, manifest, img := readImage(t, ctx, target)
-			_, cacheManifest, _ := readImage(t, ctx, target+"-cache")
+			var cacheManifest ocispecs.Manifest
+			if !tc.noCacheExport {
+				_, cacheManifest, _ = readImage(t, ctx, target+"-cache")
+			}
 			t.Log("The digest may change depending on the BuildKit version, the snapshotter configuration, etc.")
 			require.Equal(t, tc.expectedDigest, desc.Digest.String())
 
@@ -6892,9 +7540,11 @@ COPY --link foo foo
 					require.Equal(t, fmt.Sprintf("%d", tm.Unix()), l.Annotations["buildkit/rewritten-timestamp"])
 				}
 			}
-			// Cache layers must *not* have rewritten-timestamp
-			for _, l := range cacheManifest.Layers {
-				require.Empty(t, l.Annotations["buildkit/rewritten-timestamp"])
+			if !tc.noCacheExport {
+				// Cache layers must *not* have rewritten-timestamp
+				for _, l := range cacheManifest.Layers {
+					require.Empty(t, l.Annotations["buildkit/rewritten-timestamp"])
+				}
 			}
 
 			// Build again, after pruning the base image layer cache.
@@ -6974,18 +7624,25 @@ func testNilContextInSolveGateway(t *testing.T, sb integration.Sandbox) {
 }
 
 func testCopyUnicodePath(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	dockerfile := []byte(`
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
 FROM alpine
 COPY test-äöü.txt /
 COPY test-%C3%A4%C3%B6%C3%BC.txt /
 COPY test+aou.txt /
-`)
+`,
+		`
+FROM nanoserver
+COPY test-äöü.txt /
+COPY test-%C3%A4%C3%B6%C3%BC.txt /
+COPY test+aou.txt /
+`,
+	))
 
 	dir := integration.Tmpdir(
 		t,
@@ -7029,12 +7686,20 @@ func testSourcePolicyWithNamedContext(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 	defer c.Close()
 
-	dockerfile := []byte(`
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
 	FROM scratch AS replace
 
 	FROM scratch
 	COPY --from=replace /foo /
-	`)
+	`,
+		`
+	FROM nanoserver AS replace
+
+	FROM nanoserver
+	COPY --from=replace /foo /
+	`,
+	))
 
 	replaceContext := integration.Tmpdir(t, fstest.CreateFile("foo", []byte("foo"), 0644))
 	mainContext := integration.Tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0600))
@@ -7045,7 +7710,10 @@ func testSourcePolicyWithNamedContext(t *testing.T, sb integration.Sandbox) {
 			{Type: client.ExporterLocal, OutputDir: out},
 		},
 		FrontendAttrs: map[string]string{
-			"context:replace": "docker-image:docker.io/library/alpine:latest",
+			"context:replace": integration.UnixOrWindows(
+				"docker-image:docker.io/library/alpine:latest",
+				"docker-image:docker.io/library/nanoserver:plus",
+			),
 		},
 		LocalMounts: map[string]fsutil.FS{
 			dockerui.DefaultLocalNameDockerfile: mainContext,
@@ -7057,7 +7725,10 @@ func testSourcePolicyWithNamedContext(t *testing.T, sb integration.Sandbox) {
 				{
 					Action: spb.PolicyAction_CONVERT,
 					Selector: &spb.Selector{
-						Identifier: "docker-image://docker.io/library/alpine:latest",
+						Identifier: integration.UnixOrWindows(
+							"docker-image://docker.io/library/alpine:latest",
+							"docker-image://docker.io/library/nanoserver:plus",
+						),
 					},
 					Updates: &spb.Update{
 						Identifier: "local://test",
@@ -7071,6 +7742,265 @@ func testSourcePolicyWithNamedContext(t *testing.T, sb integration.Sandbox) {
 	dt, err := os.ReadFile(filepath.Join(out, "foo"))
 	require.NoError(t, err)
 	require.Equal(t, "foo", string(dt))
+}
+
+func testBaseImagePlatformMismatch(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+	workers.CheckFeatureCompat(t, sb, workers.FeatureDirectPush)
+	ctx := sb.Context()
+
+	c, err := client.New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`
+FROM scratch
+COPY foo /foo
+`)
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("foo", []byte("test"), 0644),
+	)
+
+	// choose target platform that is different from the current platform
+	targetPlatform := runtime.GOOS + "/arm64"
+	if runtime.GOARCH == "arm64" {
+		targetPlatform = runtime.GOOS + "/amd64"
+	}
+
+	target := registry + "/buildkit/testbaseimageplatform:latest"
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+		FrontendAttrs: map[string]string{
+			"platform": targetPlatform,
+		},
+		Exports: []client.ExportEntry{
+			{
+				Type: client.ExporterImage,
+				Attrs: map[string]string{
+					"name": target,
+					"push": "true",
+				},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	dockerfile = []byte(fmt.Sprintf(`
+FROM %s
+ENV foo=bar
+	`, target))
+
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile: dockerfile,
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "InvalidBaseImagePlatform",
+				Description: "Base image platform does not match expected target platform",
+				Detail:      fmt.Sprintf("Base image %s was pulled with platform %q, expected %q for current build", target, targetPlatform, runtime.GOOS+"/"+runtime.GOARCH),
+				Level:       1,
+				Line:        2,
+			},
+		},
+		FrontendAttrs: map[string]string{},
+	})
+}
+
+func testHistoryError(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureDirectPush)
+	ctx := sb.Context()
+
+	c, err := client.New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
+FROM scratch
+COPY notexist /foo
+`,
+		`
+FROM nanoserver
+COPY notexist /foo
+`,
+	))
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	ref := identity.NewID()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		Ref: ref,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.Error(t, err)
+
+	expectedError := err
+
+	cl, err := c.ControlClient().ListenBuildHistory(sb.Context(), &controlapi.BuildHistoryRequest{
+		EarlyExit: true,
+		Ref:       ref,
+	})
+	require.NoError(t, err)
+
+	got := false
+	for {
+		resp, err := cl.Recv()
+		if err == io.EOF {
+			require.Equal(t, true, got, "expected error was %+v", expectedError)
+			break
+		}
+		require.NoError(t, err)
+		require.NotEmpty(t, resp.Record.Error)
+		got = true
+
+		require.Len(t, resp.Record.Error.Details, 0)
+		require.Contains(t, resp.Record.Error.Message, "/notexist")
+
+		extErr := resp.Record.ExternalError
+		require.NotNil(t, extErr)
+
+		require.Greater(t, extErr.Size_, int64(0))
+		require.Equal(t, "application/vnd.googeapis.google.rpc.status+proto", extErr.MediaType)
+
+		bkstore := proxy.NewContentStore(c.ContentClient())
+
+		dt, err := content.ReadBlob(ctx, bkstore, ocispecs.Descriptor{
+			MediaType: extErr.MediaType,
+			Digest:    extErr.Digest,
+			Size:      extErr.Size_,
+		})
+		require.NoError(t, err)
+
+		var st rpc.Status
+		err = (&st).Unmarshal(dt)
+		require.NoError(t, err)
+
+		require.Equal(t, resp.Record.Error.Code, st.Code)
+		require.Equal(t, resp.Record.Error.Message, st.Message)
+
+		details := make([]*anypb.Any, len(st.Details))
+		for i, d := range st.Details {
+			details[i] = &anypb.Any{
+				TypeUrl: d.TypeUrl,
+				Value:   d.Value,
+			}
+		}
+
+		err = grpcerrors.FromGRPC(status.FromProto(&statuspb.Status{
+			Code:    int32(st.Code),
+			Message: st.Message,
+			Details: details,
+		}).Err())
+
+		require.Error(t, err)
+
+		// typed error has stacks
+		stacks := stack.Traces(err)
+		require.Greater(t, len(stacks), 1)
+
+		// contains vertex metadata
+		var ve *errdefs.VertexError
+		if errors.As(err, &ve) {
+			_, err := digest.Parse(ve.Digest)
+			require.NoError(t, err)
+		} else {
+			t.Fatalf("did not find vertex error")
+		}
+
+		// source points to Dockerfile
+		sources := errdefs.Sources(err)
+		require.Len(t, sources, 1)
+
+		src := sources[0]
+		require.Equal(t, "Dockerfile", src.Info.Filename)
+		require.Equal(t, dockerfile, src.Info.Data)
+		require.NotNil(t, src.Info.Definition)
+	}
+}
+
+func testHistoryFinalizeTrace(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureDirectPush)
+	ctx := sb.Context()
+
+	c, err := client.New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
+FROM scratch
+COPY Dockerfile /foo
+`,
+		`
+FROM nanoserver
+COPY Dockerfile /foo
+`,
+	))
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	ref := identity.NewID()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		Ref: ref,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	_, err = c.ControlClient().UpdateBuildHistory(sb.Context(), &controlapi.UpdateBuildHistoryRequest{
+		Ref:      ref,
+		Finalize: true,
+	})
+	require.NoError(t, err)
+
+	cl, err := c.ControlClient().ListenBuildHistory(sb.Context(), &controlapi.BuildHistoryRequest{
+		EarlyExit: true,
+		Ref:       ref,
+	})
+	require.NoError(t, err)
+
+	got := false
+	for {
+		resp, err := cl.Recv()
+		if err == io.EOF {
+			require.Equal(t, true, got)
+			break
+		}
+		require.NoError(t, err)
+		got = true
+
+		trace := resp.Record.Trace
+		require.NotEmpty(t, trace)
+
+		require.NotEmpty(t, trace.Digest)
+	}
 }
 
 func runShell(dir string, cmds ...string) error {
@@ -7132,7 +8062,7 @@ func checkAllReleasable(t *testing.T, c *client.Client, sb integration.Sandbox, 
 	retries := 0
 loop0:
 	for {
-		require.True(t, 20 > retries)
+		require.Less(t, retries, 20)
 		retries++
 		du, err := c.DiskUsage(sb.Context())
 		require.NoError(t, err)
@@ -7178,7 +8108,7 @@ loop0:
 		if count == 0 {
 			break
 		}
-		require.True(t, 20 > retries)
+		require.Less(t, retries, 20)
 		retries++
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -7198,7 +8128,7 @@ loop0:
 		if count == 0 {
 			break
 		}
-		require.True(t, 20 > retries)
+		require.Less(t, retries, 20)
 		retries++
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -7251,6 +8181,7 @@ func (f *clientFrontend) SolveGateway(ctx context.Context, c gateway.Client, req
 func (f *clientFrontend) DFCmdArgs(ctx, dockerfile string) (string, string) {
 	return "", ""
 }
+
 func (f *clientFrontend) RequiresBuildctl(t *testing.T) {
 	t.Skip()
 }
@@ -7311,8 +8242,10 @@ func (*secModeInsecure) UpdateConfigFile(in string) string {
 	return in + "\n\ninsecure-entitlements = [\"security.insecure\"]\n"
 }
 
-var securityInsecureGranted integration.ConfigUpdater = &secModeInsecure{}
-var securityInsecureDenied integration.ConfigUpdater = &secModeSandbox{}
+var (
+	securityInsecureGranted integration.ConfigUpdater = &secModeInsecure{}
+	securityInsecureDenied  integration.ConfigUpdater = &secModeSandbox{}
+)
 
 type networkModeHost struct{}
 
@@ -7326,8 +8259,10 @@ func (*networkModeSandbox) UpdateConfigFile(in string) string {
 	return in
 }
 
-var networkHostGranted integration.ConfigUpdater = &networkModeHost{}
-var networkHostDenied integration.ConfigUpdater = &networkModeSandbox{}
+var (
+	networkHostGranted integration.ConfigUpdater = &networkModeHost{}
+	networkHostDenied  integration.ConfigUpdater = &networkModeSandbox{}
+)
 
 func fixedWriteCloser(wc io.WriteCloser) filesync.FileOutputFunc {
 	return func(map[string]string) (io.WriteCloser, error) {

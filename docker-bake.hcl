@@ -46,6 +46,11 @@ variable "GOLANGCI_LINT_MULTIPLATFORM" {
 variable "DESTDIR" {
   default = ""
 }
+
+variable "TEST_COVERAGE" {
+  default = null
+}
+
 function "bindir" {
   params = [defaultdir]
   result = DESTDIR != "" ? DESTDIR : "./bin/${defaultdir}"
@@ -115,10 +120,13 @@ target "integration-tests-base" {
 target "integration-tests" {
   inherits = ["integration-tests-base"]
   target = "integration-tests"
+  args = {
+    GOBUILDFLAGS = TEST_COVERAGE == "1" ? "-cover" : null
+  }
 }
 
 group "validate" {
-  targets = ["lint", "validate-vendor", "validate-doctoc", "validate-generated-files", "validate-archutil", "validate-shfmt", "validate-docs"]
+  targets = ["lint", "validate-vendor", "validate-doctoc", "validate-dockerfile", "validate-generated-files", "validate-archutil", "validate-shfmt", "validate-docs", "validate-docs-dockerfile"]
 }
 
 target "lint" {
@@ -147,6 +155,7 @@ target "lint" {
       { name = "labs", tags = "dfrunsecurity dfparents dfexcludepatterns", target = "golangci-lint" },
       { name = "nydus", tags = "nydus", target = "golangci-lint" },
       { name = "yaml", tags = "", target = "yamllint" },
+      { name = "golangci-verify", tags = "", target = "golangci-verify" },
       { name = "proto", tags = "", target = "protolint" },
       { name = "gopls", tags = "", target = "gopls-analyze" }
     ]
@@ -202,6 +211,35 @@ target "validate-docs" {
   output = ["type=cacheonly"]
 }
 
+target "validate-docs-dockerfile" {
+  inherits = ["_common"]
+  dockerfile = "./hack/dockerfiles/docs-dockerfile.Dockerfile"
+  target = "validate"
+  output = ["type=cacheonly"]
+}
+
+target "validate-dockerfile" {
+  matrix = {
+    dockerfile = [
+      "Dockerfile",
+      "./hack/dockerfiles/archutil.Dockerfile",
+      "./hack/dockerfiles/authors.Dockerfile",
+      "./hack/dockerfiles/docs-dockerfile.Dockerfile",
+      "./hack/dockerfiles/docs.Dockerfile",
+      "./hack/dockerfiles/doctoc.Dockerfile",
+      "./hack/dockerfiles/generated-files.Dockerfile",
+      "./hack/dockerfiles/govulncheck.Dockerfile",
+      "./hack/dockerfiles/lint.Dockerfile",
+      "./hack/dockerfiles/shfmt.Dockerfile",
+      "./hack/dockerfiles/vendor.Dockerfile",
+      "./frontend/dockerfile/cmd/dockerfile-frontend/Dockerfile",
+    ]
+  }
+  name = "validate-dockerfile-${md5(dockerfile)}"
+  dockerfile = dockerfile
+  call = "check"
+}
+
 target "vendor" {
   inherits = ["_common"]
   dockerfile = "./hack/dockerfiles/vendor.Dockerfile"
@@ -251,10 +289,32 @@ target "docs" {
   output = ["./docs"]
 }
 
+target "docs-dockerfile" {
+  inherits = ["_common"]
+  dockerfile = "./hack/dockerfiles/docs-dockerfile.Dockerfile"
+  target = "update"
+  output = ["./frontend/dockerfile/docs/rules"]
+}
+
 target "mod-outdated" {
   inherits = ["_common"]
   dockerfile = "./hack/dockerfiles/vendor.Dockerfile"
   target = "outdated"
   no-cache-filter = ["outdated"]
   output = ["type=cacheonly"]
+}
+
+variable "GOVULNCHECK_FORMAT" {
+  default = null
+}
+
+target "govulncheck" {
+  inherits = ["_common"]
+  dockerfile = "./hack/dockerfiles/govulncheck.Dockerfile"
+  target = "output"
+  args = {
+    FORMAT = GOVULNCHECK_FORMAT
+  }
+  no-cache-filter = ["run"]
+  output = ["${DESTDIR}"]
 }

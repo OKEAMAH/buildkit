@@ -71,19 +71,19 @@ func ParseInstruction(node *parser.Node) (v interface{}, err error) {
 }
 
 // ParseInstruction converts an AST to a typed instruction (either a command or a build stage beginning when encountering a `FROM` statement)
-func ParseInstructionWithLinter(node *parser.Node, lintWarn linter.LintWarnFunc) (v interface{}, err error) {
+func ParseInstructionWithLinter(node *parser.Node, lint *linter.Linter) (v interface{}, err error) {
 	defer func() {
-		err = parser.WithLocation(err, node.Location())
+		if err != nil {
+			err = parser.WithLocation(err, node.Location())
+		}
 	}()
 	req := newParseRequestFromNode(node)
 	switch strings.ToLower(node.Value) {
 	case command.Env:
 		return parseEnv(req)
 	case command.Maintainer:
-		if lintWarn != nil {
-			msg := linter.RuleMaintainerDeprecated.Format()
-			linter.RuleMaintainerDeprecated.Run(lintWarn, node.Location(), msg)
-		}
+		msg := linter.RuleMaintainerDeprecated.Format()
+		lint.Run(&linter.RuleMaintainerDeprecated, node.Location(), msg)
 		return parseMaintainer(req)
 	case command.Label:
 		return parseLabel(req)
@@ -92,13 +92,13 @@ func ParseInstructionWithLinter(node *parser.Node, lintWarn linter.LintWarnFunc)
 	case command.Copy:
 		return parseCopy(req)
 	case command.From:
-		if lintWarn != nil && !isLowerCaseStageName(req.args) {
+		if !isLowerCaseStageName(req.args) {
 			msg := linter.RuleStageNameCasing.Format(req.args[2])
-			linter.RuleStageNameCasing.Run(lintWarn, node.Location(), msg)
+			lint.Run(&linter.RuleStageNameCasing, node.Location(), msg)
 		}
-		if lintWarn != nil && !doesFromCaseMatchAsCase(req) {
+		if !doesFromCaseMatchAsCase(req) {
 			msg := linter.RuleFromAsCasing.Format(req.command, req.args[1])
-			linter.RuleFromAsCasing.Run(lintWarn, node.Location(), msg)
+			lint.Run(&linter.RuleFromAsCasing, node.Location(), msg)
 		}
 		return parseFrom(req)
 	case command.Onbuild:
@@ -166,7 +166,7 @@ func (e *parseError) Unwrap() error {
 
 // Parse a Dockerfile into a collection of buildable stages.
 // metaArgs is a collection of ARG instructions that occur before the first FROM.
-func Parse(ast *parser.Node, lint linter.LintWarnFunc) (stages []Stage, metaArgs []ArgCommand, err error) {
+func Parse(ast *parser.Node, lint *linter.Linter) (stages []Stage, metaArgs []ArgCommand, err error) {
 	for _, n := range ast.Children {
 		cmd, err := ParseInstructionWithLinter(n, lint)
 		if err != nil {
@@ -199,18 +199,17 @@ func parseKvps(args []string, cmdName string) (KeyValuePairs, error) {
 	if len(args) == 0 {
 		return nil, errAtLeastOneArgument(cmdName)
 	}
-	if len(args)%2 != 0 {
+	if len(args)%3 != 0 {
 		// should never get here, but just in case
 		return nil, errTooManyArguments(cmdName)
 	}
 	var res KeyValuePairs
-	for j := 0; j < len(args); j += 2 {
+	for j := 0; j < len(args); j += 3 {
 		if len(args[j]) == 0 {
 			return nil, errBlankCommandNames(cmdName)
 		}
-		name := args[j]
-		value := args[j+1]
-		res = append(res, KeyValuePair{Key: name, Value: value})
+		name, value, delim := args[j], args[j+1], args[j+2]
+		res = append(res, KeyValuePair{Key: name, Value: value, NoDelim: delim == ""})
 	}
 	return res, nil
 }
@@ -399,6 +398,7 @@ func parseFrom(req parseRequest) (*Stage, error) {
 	code := strings.TrimSpace(req.original)
 	return &Stage{
 		BaseName:   req.args[0],
+		OrigCmd:    req.command,
 		Name:       stageName,
 		SourceCode: code,
 		Commands:   []Command{},

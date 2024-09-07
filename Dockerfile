@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile-upstream:master
 
-ARG RUNC_VERSION=v1.1.12
-ARG CONTAINERD_VERSION=v1.7.11
+ARG RUNC_VERSION=v1.1.14
+ARG CONTAINERD_VERSION=v1.7.21
 # containerd v1.6 for integration tests
-ARG CONTAINERD_ALT_VERSION_16=v1.6.24
+ARG CONTAINERD_ALT_VERSION_16=v1.6.33
 ARG REGISTRY_VERSION=v2.8.3
-ARG ROOTLESSKIT_VERSION=v2.0.0
-ARG CNI_VERSION=v1.3.0
+ARG ROOTLESSKIT_VERSION=v2.0.2
+ARG CNI_VERSION=v1.5.1
 ARG STARGZ_SNAPSHOTTER_VERSION=v0.15.1
 ARG NERDCTL_VERSION=v1.6.2
 ARG DNSNAME_VERSION=v1.3.1
@@ -15,37 +15,22 @@ ARG MINIO_VERSION=RELEASE.2022-05-03T20-36-08Z
 ARG MINIO_MC_VERSION=RELEASE.2022-05-04T06-07-55Z
 ARG AZURITE_VERSION=3.18.0
 ARG GOTESTSUM_VERSION=v1.9.0
-ARG DELVE_VERSION=v1.21.0
+ARG DELVE_VERSION=v1.22.1
 
-ARG GO_VERSION=1.21
-ARG ALPINE_VERSION=3.19
+ARG GO_VERSION=1.22
+ARG ALPINE_VERSION=3.20
 ARG XX_VERSION=1.4.0
 ARG BUILDKIT_DEBUG
-
-ARG ALPINE_ARCH=${TARGETARCH#riscv64}
-ARG ALPINE_ARCH=${ALPINE_ARCH:+"default"}
-ARG ALPINE_ARCH=${ALPINE_ARCH:-$TARGETARCH}
 
 # minio for s3 integration tests
 FROM minio/minio:${MINIO_VERSION} AS minio
 FROM minio/mc:${MINIO_MC_VERSION} AS minio-mc
-
-# alpine base for buildkit image
-# TODO: remove this when alpine image supports riscv64
-FROM alpine:${ALPINE_VERSION} AS alpine-default
-FROM alpine:edge@sha256:2d01a16bab53a8405876cec4c27235d47455a7b72b75334c614f2fb0968b3f90 AS alpine-riscv64
-FROM alpine-${ALPINE_ARCH} AS alpinebase
-
 
 # xx is a helper for cross-compilation
 FROM --platform=$BUILDPLATFORM tonistiigi/xx:${XX_VERSION} AS xx
 
 # go base image
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS golatest
-
-# git stage is used for checking out remote repository sources
-FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS git
-RUN apk add --no-cache git
 
 # gobuild is base stage for compiling go/cgo
 FROM golatest AS gobuild-base
@@ -59,23 +44,17 @@ RUN --mount=target=/root/.cache,type=cache \
   --mount=target=/go/pkg/mod,type=cache \
   GOBIN=/usr/bin go install github.com/go-delve/delve/cmd/dlv@${DELVE_VERSION}
 
-# runc source
-FROM git AS runc-src
-ARG RUNC_VERSION
-WORKDIR /usr/src
-RUN git clone https://github.com/opencontainers/runc.git runc \
-  && cd runc && git checkout -q "$RUNC_VERSION"
-
 # build runc binary
 FROM gobuild-base AS runc
 WORKDIR $GOPATH/src/github.com/opencontainers/runc
+ARG RUNC_VERSION
+ADD --keep-git-dir=true "https://github.com/opencontainers/runc.git#$RUNC_VERSION" .
 ARG TARGETPLATFORM
 # gcc is only installed for libgcc
 # lld has issues building static binaries for ppc so prefer ld for it
 RUN set -e; xx-apk add musl-dev gcc libseccomp-dev libseccomp-static; \
   [ "$(xx-info arch)" != "ppc64le" ] || XX_CC_PREFER_LINKER=ld xx-clang --setup-target-triple
-RUN --mount=from=runc-src,src=/usr/src/runc,target=. \
-  --mount=target=/root/.cache,type=cache <<EOT
+RUN --mount=target=/root/.cache,type=cache <<EOT
   set -ex
   CGO_ENABLED=1 xx-go build -mod=vendor -ldflags '-extldflags -static' -tags 'apparmor seccomp netgo cgo static_build osusergo' -o /usr/bin/runc ./
   xx-verify --static /usr/bin/runc
@@ -89,20 +68,27 @@ ENV GOFLAGS=-mod=vendor
 # scan the version/revision info
 FROM buildkit-base AS buildkit-version
 # TODO: PKG should be inferred from go modules
-RUN --mount=target=. \
-  PKG=github.com/moby/buildkit VERSION=$(git describe --match 'v[0-9]*' --dirty='.m' --always --tags) REVISION=$(git rev-parse HEAD)$(if ! git diff --no-ext-diff --quiet --exit-code; then echo .m; fi); \
-  echo "-X ${PKG}/version.Version=${VERSION} -X ${PKG}/version.Revision=${REVISION} -X ${PKG}/version.Package=${PKG}" | tee /tmp/.ldflags; \
-  echo -n "${VERSION}" | tee /tmp/.version;
+RUN --mount=target=. <<'EOT'
+  git rev-parse HEAD 2>/dev/null || {
+    echo >&2 "Failed to get git revision, make sure --build-arg BUILDKIT_CONTEXT_KEEP_GIT_DIR=1 is set when building from Git directly"
+    exit 1
+  }
+  set -ex
+  export PKG=github.com/moby/buildkit VERSION=$(git describe --match 'v[0-9]*' --dirty='.m' --always --tags) REVISION=$(git rev-parse HEAD)$(if ! git diff --no-ext-diff --quiet --exit-code; then echo .m; fi);
+  echo "-X ${PKG}/version.Version=${VERSION} -X ${PKG}/version.Revision=${REVISION} -X ${PKG}/version.Package=${PKG}" > /tmp/.ldflags;
+  echo -n "${VERSION}" > /tmp/.version;
+EOT
 
 # build buildctl binary
 FROM buildkit-base AS buildctl
 ENV CGO_ENABLED=0
 ARG TARGETPLATFORM
+ARG GOBUILDFLAGS
 RUN --mount=target=. --mount=target=/root/.cache,type=cache \
   --mount=target=/go/pkg/mod,type=cache \
   --mount=source=/tmp/.ldflags,target=/tmp/.ldflags,from=buildkit-version <<EOT
   set -ex
-  xx-go build -ldflags "$(cat /tmp/.ldflags)" -o /usr/bin/buildctl ./cmd/buildctl
+  xx-go build ${GOBUILDFLAGS} -ldflags "$(cat /tmp/.ldflags)" -o /usr/bin/buildctl ./cmd/buildctl
   xx-verify --static /usr/bin/buildctl
   if [ "$(xx-info os)" = "linux" ]; then /usr/bin/buildctl --version; fi
 EOT
@@ -149,19 +135,13 @@ RUN --mount=target=. --mount=target=/root/.cache,type=cache \
   fi
 EOT
 
-# dnsname source
-FROM git AS dnsname-src
-ARG DNSNAME_VERSION
-WORKDIR /usr/src
-RUN git clone https://github.com/containers/dnsname.git dnsname \
-  && cd dnsname && git checkout -q "$DNSNAME_VERSION"
-
 # build dnsname CNI plugin for testing
 FROM gobuild-base AS dnsname
 WORKDIR /go/src/github.com/containers/dnsname
+ARG DNSNAME_VERSION
+ADD --keep-git-dir=true "https://github.com/containers/dnsname.git#$DNSNAME_VERSION" .
 ARG TARGETPLATFORM
-RUN --mount=from=dnsname-src,src=/usr/src/dnsname,target=.,rw \
-    --mount=target=/root/.cache,type=cache \
+RUN --mount=target=/root/.cache,type=cache \
     CGO_ENABLED=0 xx-go build -o /usr/bin/dnsname ./plugins/meta/dnsname && \
     xx-verify --static /usr/bin/dnsname
 
@@ -220,29 +200,21 @@ RUN --mount=from=binaries \
 FROM scratch AS release
 COPY --link --from=releaser /out/ /
 
-FROM alpinebase AS buildkit-export
+FROM alpine:${ALPINE_VERSION} AS buildkit-export
 RUN apk add --no-cache fuse3 git openssh pigz xz iptables ip6tables \
   && ln -s fusermount3 /usr/bin/fusermount
 COPY --link examples/buildctl-daemonless/buildctl-daemonless.sh /usr/bin/
 VOLUME /var/lib/buildkit
 
-FROM git AS containerd-src
-WORKDIR /usr/src
-RUN git clone https://github.com/containerd/containerd.git containerd
-
-FROM gobuild-base AS containerd-base
+FROM gobuild-base AS containerd
 WORKDIR /go/src/github.com/containerd/containerd
+ARG CONTAINERD_VERSION
+ADD --keep-git-dir=true "https://github.com/containerd/containerd.git#$CONTAINERD_VERSION" .
 ARG TARGETPLATFORM
 ENV CGO_ENABLED=1 BUILDTAGS=no_btrfs GO111MODULE=off
 RUN xx-apk add musl-dev gcc && xx-go --wrap
-
-FROM containerd-base AS containerd
-ARG CONTAINERD_VERSION
-RUN --mount=from=containerd-src,src=/usr/src/containerd,rw \
-    --mount=target=/root/.cache,type=cache <<EOT
+RUN --mount=target=/root/.cache,type=cache <<EOT
   set -ex
-  git fetch origin
-  git checkout -q "$CONTAINERD_VERSION"
   mkdir /out
   ext=""
   if [ "$(xx-info os)" = "windows" ]; then
@@ -259,13 +231,15 @@ RUN --mount=from=containerd-src,src=/usr/src/containerd,rw \
 EOT
 
 # containerd v1.6 for integration tests
-FROM containerd-base AS containerd-alt-16
+FROM gobuild-base AS containerd-alt-16
+WORKDIR /go/src/github.com/containerd/containerd
 ARG CONTAINERD_ALT_VERSION_16
-RUN --mount=from=containerd-src,src=/usr/src/containerd,rw \
-    --mount=target=/root/.cache,type=cache <<EOT
+ADD --keep-git-dir=true "https://github.com/containerd/containerd.git#$CONTAINERD_ALT_VERSION_16" .
+ARG TARGETPLATFORM
+ENV CGO_ENABLED=1 BUILDTAGS=no_btrfs GO111MODULE=off
+RUN xx-apk add musl-dev gcc && xx-go --wrap
+RUN --mount=target=/root/.cache,type=cache <<EOT
   set -ex
-  git fetch origin
-  git checkout -q "$CONTAINERD_ALT_VERSION_16"
   mkdir /out
   ext=""
   if [ "$(xx-info os)" = "windows" ]; then
@@ -281,19 +255,13 @@ RUN --mount=from=containerd-src,src=/usr/src/containerd,rw \
   fi
 EOT
 
-FROM git AS registry-src
-WORKDIR /usr/src
-RUN git clone https://github.com/distribution/distribution.git distribution
-
 FROM gobuild-base AS registry
-ARG REGISTRY_VERSION
-ARG TARGETPLATFORM
 WORKDIR /go/src/github.com/docker/distribution
-RUN --mount=from=registry-src,src=/usr/src/distribution,rw \
-    --mount=target=/root/.cache,type=cache <<EOT
+ARG REGISTRY_VERSION
+ADD --keep-git-dir=true "https://github.com/distribution/distribution.git#$REGISTRY_VERSION" .
+ARG TARGETPLATFORM
+RUN --mount=target=/root/.cache,type=cache <<EOT
   set -ex
-  git fetch origin
-  git checkout -q "$REGISTRY_VERSION"
   mkdir /out
   export GOPATH="$(pwd)/Godeps/_workspace:$GOPATH"
   GO111MODULE=off CGO_ENABLED=0 xx-go build -o /out/registry ./cmd/registry
@@ -304,22 +272,20 @@ RUN --mount=from=registry-src,src=/usr/src/distribution,rw \
 EOT
 
 FROM gobuild-base AS rootlesskit
-ARG ROOTLESSKIT_VERSION
-RUN git clone https://github.com/rootless-containers/rootlesskit.git /go/src/github.com/rootless-containers/rootlesskit
 WORKDIR /go/src/github.com/rootless-containers/rootlesskit
+ARG ROOTLESSKIT_VERSION
+ADD --keep-git-dir=true "https://github.com/rootless-containers/rootlesskit.git#$ROOTLESSKIT_VERSION" .
 ARG TARGETPLATFORM
 RUN  --mount=target=/root/.cache,type=cache \
-  git checkout -q "$ROOTLESSKIT_VERSION"  && \
   CGO_ENABLED=0 xx-go build -o /rootlesskit ./cmd/rootlesskit && \
   xx-verify --static /rootlesskit
 
 FROM gobuild-base AS stargz-snapshotter
-ARG STARGZ_SNAPSHOTTER_VERSION
-RUN git clone https://github.com/containerd/stargz-snapshotter.git /go/src/github.com/containerd/stargz-snapshotter
 WORKDIR /go/src/github.com/containerd/stargz-snapshotter
+ARG STARGZ_SNAPSHOTTER_VERSION
+ADD --keep-git-dir=true "https://github.com/containerd/stargz-snapshotter.git#$STARGZ_SNAPSHOTTER_VERSION" .
 ARG TARGETPLATFORM
 RUN --mount=target=/root/.cache,type=cache \
-  git checkout -q "$STARGZ_SNAPSHOTTER_VERSION" && \
   xx-go --wrap && \
   mkdir /out && CGO_ENABLED=0 PREFIX=/out/ make && \
   xx-verify --static /out/containerd-stargz-grpc && \
@@ -339,14 +305,37 @@ ARG TARGETPLATFORM
 RUN --mount=target=/root/.cache,type=cache <<EOT
   set -ex
   xx-go install "gotest.tools/gotestsum@${GOTESTSUM_VERSION}"
+  xx-go install "github.com/wadey/gocovmerge@latest"
   mkdir /out
   if ! xx-info is-cross; then
     /go/bin/gotestsum --version
     mv /go/bin/gotestsum /out
+    mv /go/bin/gocovmerge /out
   else
     mv /go/bin/*/gotestsum* /out
+    mv /go/bin/*/gocovmerge* /out
   fi
 EOT
+COPY --chmod=755 <<"EOF" /out/gotestsumandcover
+#!/bin/sh
+set -x
+if [ -z "$GO_TEST_COVERPROFILE" ]; then
+  exec gotestsum "$@"
+fi
+coverdir="$(dirname "$GO_TEST_COVERPROFILE")"
+mkdir -p "$coverdir/helpers"
+gotestsum "$@" "-coverprofile=$GO_TEST_COVERPROFILE"
+ecode=$?
+go tool covdata textfmt -i=$coverdir/helpers -o=$coverdir/helpers-report.txt
+gocovmerge "$coverdir/helpers-report.txt" "$GO_TEST_COVERPROFILE" > "$coverdir/merged-report.txt"
+mv "$coverdir/merged-report.txt" "$GO_TEST_COVERPROFILE"
+rm "$coverdir/helpers-report.txt"
+for f in "$coverdir/helpers"/*; do
+  rm "$f"
+done
+rmdir "$coverdir/helpers"
+exit $ecode
+EOF
 
 FROM buildkit-export AS buildkit-linux
 COPY --link --from=binaries / /usr/bin/
@@ -365,7 +354,7 @@ exec dlv exec /usr/bin/buildkitd \\
   --continue \\
   -- "\$@"
 EOF
-ENV DELVE_PORT 5000
+ENV DELVE_PORT=5000
 ENTRYPOINT ["/docker-entrypoint.sh"]
 
 FROM binaries AS buildkit-darwin
@@ -430,7 +419,7 @@ FROM integration-tests AS dev-env
 VOLUME /var/lib/buildkit
 
 # Rootless mode.
-FROM alpinebase AS rootless
+FROM alpine:${ALPINE_VERSION} AS rootless
 RUN apk add --no-cache fuse3 fuse-overlayfs git openssh pigz shadow-uidmap xz
 RUN adduser -D -u 1000 user \
   && mkdir -p /run/user/1000 /home/user/.local/tmp /home/user/.local/share/buildkit \
@@ -441,8 +430,8 @@ COPY --link --from=binaries / /usr/bin/
 COPY --link examples/buildctl-daemonless/buildctl-daemonless.sh /usr/bin/
 # Kubernetes runAsNonRoot requires USER to be numeric
 USER 1000:1000
-ENV HOME /home/user
-ENV USER user
+ENV HOME=/home/user
+ENV USER=user
 ENV XDG_RUNTIME_DIR=/run/user/1000
 ENV TMPDIR=/home/user/.local/tmp
 ENV BUILDKIT_HOST=unix:///run/user/1000/buildkit/buildkitd.sock

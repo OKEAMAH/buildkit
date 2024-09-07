@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/containerd/containerd/platforms"
+	"github.com/containerd/platforms"
 	"github.com/moby/buildkit/solver/pb"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/stretchr/testify/require"
@@ -52,7 +52,7 @@ func TestDefinitionEquivalence(t *testing.T) {
 
 			for i := 0; i < len(def.Def); i++ {
 				res := bytes.Compare(def.Def[i], def2.Def[i])
-				require.Equal(t, res, 0)
+				require.Equal(t, 0, res)
 			}
 
 			for dgst := range def.Metadata {

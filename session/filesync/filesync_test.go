@@ -8,6 +8,7 @@ import (
 
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/testutil"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tonistiigi/fsutil"
@@ -29,7 +30,7 @@ func TestFileSyncIncludePatterns(t *testing.T) {
 	err = os.WriteFile(filepath.Join(tmpDir, "bar"), []byte("content2"), 0600)
 	require.NoError(t, err)
 
-	s, err := session.NewSession(ctx, "foo", "bar")
+	s, err := session.NewSession(ctx, "bar")
 	require.NoError(t, err)
 
 	m, err := session.NewManager()
@@ -47,6 +48,13 @@ func TestFileSyncIncludePatterns(t *testing.T) {
 	})
 
 	g.Go(func() (reterr error) {
+		defer func() {
+			err := s.Close()
+			if reterr == nil {
+				reterr = err
+			}
+		}()
+
 		c, err := m.Get(ctx, s.ID(), false)
 		if err != nil {
 			return err
@@ -59,15 +67,16 @@ func TestFileSyncIncludePatterns(t *testing.T) {
 			return err
 		}
 
-		_, err = os.ReadFile(filepath.Join(destDir, "foo"))
-		assert.Error(t, err)
+		if _, err := os.ReadFile(filepath.Join(destDir, "foo")); err == nil {
+			return errors.Errorf("expected error reading foo")
+		}
 
 		dt, err := os.ReadFile(filepath.Join(destDir, "bar"))
 		if err != nil {
 			return err
 		}
 		assert.Equal(t, "content2", string(dt))
-		return s.Close()
+		return nil
 	})
 
 	err = g.Wait()

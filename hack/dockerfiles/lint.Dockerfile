@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile-upstream:master
 
-ARG GO_VERSION=1.21
-ARG ALPINE_VERSION=3.19
+ARG GO_VERSION=1.22
+ARG ALPINE_VERSION=3.20
 ARG XX_VERSION=1.4.0
 ARG PROTOLINT_VERSION=0.45.0
-ARG GOLANGCI_LINT_VERSION=1.57.1
+ARG GOLANGCI_LINT_VERSION=1.60.1
 ARG GOPLS_VERSION=v0.20.0
 # disabled: deprecated unusedvariable simplifyrange
 ARG GOPLS_ANALYZERS="embeddirective fillreturns infertypeargs nonewvars noresultvalues simplifycompositelit simplifyslice stubmethods undeclaredname unusedparams useany"
@@ -31,6 +31,12 @@ RUN --mount=target=/go/src/github.com/moby/buildkit \
   xx-go --wrap && \
   golangci-lint run --build-tags "${BUILDTAGS}" && \
   touch /golangci-lint.done
+  
+
+FROM base AS golangci-verify
+RUN --mount=target=/go/src/github.com/moby/buildkit \
+  golangci-lint config verify && \
+  touch /golangci-verify.done
 
 FROM base AS yamllint
 RUN --mount=target=/go/src/github.com/moby/buildkit \
@@ -89,5 +95,6 @@ EOF
 
 FROM scratch
 COPY --link --from=golangci-lint /golangci-lint.done /
+COPY --link --from=golangci-verify /golangci-verify.done /
 COPY --link --from=yamllint /yamllint.done /
 COPY --link --from=protolint /protolint.done /

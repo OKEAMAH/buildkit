@@ -16,6 +16,7 @@ import (
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/cmd/buildctl/build"
 	bccommon "github.com/moby/buildkit/cmd/buildctl/common"
+	"github.com/moby/buildkit/frontend"
 	gateway "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
@@ -289,10 +290,8 @@ func buildAction(clicontext *cli.Context) error {
 		if len(def.Def) == 0 {
 			return errors.Errorf("empty definition sent to build. Specify --frontend instead?")
 		}
-	} else {
-		if clicontext.Bool("no-cache") {
-			solveOpt.FrontendAttrs["no-cache"] = ""
-		}
+	} else if clicontext.Bool("no-cache") {
+		solveOpt.FrontendAttrs["no-cache"] = ""
 	}
 
 	refFile := clicontext.String("ref-file")
@@ -365,6 +364,15 @@ func buildAction(clicontext *cli.Context) error {
 			Frontend:    solveOpt.Frontend,
 			FrontendOpt: solveOpt.FrontendAttrs,
 		}
+
+		sreq.CacheImports = make([]frontend.CacheOptionsEntry, len(solveOpt.CacheImports))
+		for i, e := range solveOpt.CacheImports {
+			sreq.CacheImports[i] = frontend.CacheOptionsEntry{
+				Type:  e.Type,
+				Attrs: e.Attrs,
+			}
+		}
+
 		if def != nil {
 			sreq.Definition = def.ToPB()
 		}
@@ -426,7 +434,6 @@ func buildAction(clicontext *cli.Context) error {
 }
 
 func writeMetadataFile(filename string, exporterResponse map[string]string) error {
-	var err error
 	out := make(map[string]interface{})
 	for k, v := range exporterResponse {
 		dt, err := base64.StdEncoding.DecodeString(v)

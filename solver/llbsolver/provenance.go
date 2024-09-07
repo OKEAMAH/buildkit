@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/platforms"
+	"github.com/containerd/platforms"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/config"
 	"github.com/moby/buildkit/client/llb/sourceresolver"
@@ -411,9 +411,10 @@ func NewProvenanceCreator(ctx context.Context, cp *provenance.Capture, res solve
 			}
 
 			if _, err := r.CacheKeys()[0].Exporter.ExportTo(ctx, e, solver.CacheExportOpt{
-				ResolveRemotes: resolveRemotes,
-				Mode:           solver.CacheExportModeRemoteOnly,
-				ExportRoots:    true,
+				ResolveRemotes:  resolveRemotes,
+				Mode:            solver.CacheExportModeRemoteOnly,
+				ExportRoots:     true,
+				IgnoreBacklinks: true,
 			}); err != nil {
 				return err
 			}

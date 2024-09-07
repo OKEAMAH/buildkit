@@ -65,6 +65,255 @@ func TestChecksumSymlinkNoParentScan(t *testing.T) {
 	dgst, err := cc.Checksum(context.TODO(), ref, "aa/ln/bb/cc/dd", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
+
+	// The above checksum request should have only checksummed aa/bb/cc, and so
+	// any parent directories should need a scan but non-existent (or existent)
+	// children should not.
+	root := cc.tree.Root()
+
+	for _, path := range []string{
+		// Paths not within the scanned /aa/bb/cc/.
+		"/", "/aa", "/aa/bb", "/aa/bb/ff", "/non-exist",
+	} {
+		needs1, err := cc.needsScan(root, path, false)
+		require.NoErrorf(t, err, "needsScan(%q, followTrailing=false)", path)
+		require.Truef(t, needs1, "needsScan(%q, followTrailing=false)", path)
+
+		needs2, err := cc.needsScan(root, path, true)
+		require.NoErrorf(t, err, "needsScan(%q, followTrailing=true)", path)
+		require.Truef(t, needs2, "needsScan(%q, followTrailing=true)", path)
+	}
+
+	for _, path := range []string{
+		// Paths within the scanned /aa/bb/cc, even if they don't exist.
+		"/aa/bb/cc", "/aa/bb/cc/non-exist", "/aa/bb/cc/dd/ee/ff", "/aa/bb/cc/non-exist/xx/yy/zz",
+	} {
+		needs1, err := cc.needsScan(root, path, false)
+		require.NoErrorf(t, err, "needsScan(%q, followTrailing=false)", path)
+		require.Falsef(t, needs1, "needsScan(%q, followTrailing=false)", path)
+
+		needs2, err := cc.needsScan(root, path, true)
+		require.NoErrorf(t, err, "needsScan(%q, followTrailing=true)", path)
+		require.Falsef(t, needs2, "needsScan(%q, followTrailing=true)", path)
+	}
+
+	// /aa was not scanned, but during the walk we went through /aa/ln and so
+	// we know the contents of the link. However, if we want to scan it with
+	// followTrailing=true, we will need a scan because we didn't scan /aa.
+	path := "/aa/ln"
+	needs1, err := cc.needsScan(root, path, false)
+	require.NoErrorf(t, err, "needsScan(%q, followTrailing=false)", path)
+	require.Falsef(t, needs1, "needsScan(%q, followTrailing=false)", path)
+
+	needs2, err := cc.needsScan(root, path, true)
+	require.NoErrorf(t, err, "needsScan(%q, followTrailing=true)", path)
+	require.Truef(t, needs2, "needsScan(%q, followTrailing=true)", path)
+}
+
+// https://github.com/moby/buildkit/issues/5042
+func TestNeedScanChecksumRegression(t *testing.T) {
+	// This test cannot be run in parallel because we use scanCounter.
+	scanCounterEnable = true
+	defer func() {
+		scanCounterEnable = false
+	}()
+
+	tmpdir := t.TempDir()
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+	cm, cleanup := setupCacheManager(t, tmpdir, "native", snapshotter)
+	t.Cleanup(cleanup)
+
+	ch := []string{
+		"ADD aa dir",
+		"ADD aa/bb dir",
+		"ADD aa/bb/cc file data0",
+		"ADD aa/ln symlink /aa",
+		"ADD aa/root symlink /",
+		"ADD bb symlink aa/bb",
+	}
+
+	ref := createRef(t, cm, ch)
+
+	cc, err := newCacheContext(ref)
+	require.NoError(t, err)
+
+	// Checksumming /aa/bb while following links will result in /aa being scanned.
+	_, err = cc.Checksum(context.TODO(), ref, "/bb", ChecksumOpts{FollowLinks: true}, nil)
+	require.NoError(t, err)
+
+	root := cc.tree.Root()
+	for _, test := range []struct {
+		path                            string
+		followTrailing, expectNeedsScan bool
+	}{
+		// Any path under /aa will not result in a re-scan.
+		{"/aa", true, false},
+		{"/aa/ln", true, false},
+		{"/aa/ln", false, false},
+		{"/aa/non-exist", true, false},
+		{"/aa/bb/non-exist", true, false},
+		{"/aa/bb/cc", true, false},
+		{"/aa/bb/cc/non-exist", true, false},
+		// followTrailing=false on a symlink to /.
+		{"/aa/root", false, false},
+		// /bb itself was scanned during the lookup in Checksum.
+		{"/bb", true, false},
+		{"/bb", false, false},
+		// A path outside /aa will need a scan.
+		{"/non-exist", true, true},
+		{"/non-exist", false, true},
+		{"/aa/root", true, true},
+		{"/", true, true},
+	} {
+		needs, err := cc.needsScan(root, test.path, test.followTrailing)
+		require.NoErrorf(t, err, "needsScan(%q, followTrailing=%v)", test.path, test.followTrailing)
+		require.Equalf(t, test.expectNeedsScan, needs, "needsScan(%q, followTrailing=%v)", test.path, test.followTrailing)
+	}
+
+	// Make sure trying to checksum a subpath results in no further scans.
+	initialScanCounter := scanCounter.Load()
+	_, err = cc.Checksum(context.TODO(), ref, "/bb/cc", ChecksumOpts{FollowLinks: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, initialScanCounter, scanCounter.Load())
+	_, err = cc.Checksum(context.TODO(), ref, "/bb/non-existent", ChecksumOpts{FollowLinks: true}, nil)
+	require.Error(t, err)
+	require.Equal(t, initialScanCounter, scanCounter.Load())
+
+	// Looking up a non-existent path in / will checksum the whole tree. See
+	// <https://github.com/moby/buildkit/issues/5042> for more information.
+	// This means that needsScan will return true for any path.
+	_, err = cc.Checksum(context.TODO(), ref, "/non-existent", ChecksumOpts{FollowLinks: true}, nil)
+	require.Error(t, err)
+	fullScanCounter := scanCounter.Load()
+	require.NotEqual(t, fullScanCounter, initialScanCounter)
+
+	root = cc.tree.Root()
+	for _, path := range []string{
+		"/", "/non-exist", "/ff", "/aa/root", "/non-exist/child", "/different-non-exist",
+	} {
+		needs1, err := cc.needsScan(root, path, false)
+		require.NoErrorf(t, err, "needsScan(%q, followTrailing=false)", path)
+		require.Falsef(t, needs1, "needsScan(%q, followTrailing=false)", path)
+
+		needs2, err := cc.needsScan(root, path, true)
+		require.NoErrorf(t, err, "needsScan(%q, followTrailing=true)", path)
+		require.Falsef(t, needs2, "needsScan(%q, followTrailing=true)", path)
+	}
+
+	// Looking up any more paths should not result in any more scans because we
+	// already know / was scanned.
+	_, err = cc.Checksum(context.TODO(), ref, "/non-existent", ChecksumOpts{FollowLinks: true}, nil)
+	require.Error(t, err)
+	require.Equal(t, fullScanCounter, scanCounter.Load())
+	_, err = cc.Checksum(context.TODO(), ref, "/different/non/existent", ChecksumOpts{FollowLinks: true}, nil)
+	require.Error(t, err)
+	require.Equal(t, fullScanCounter, scanCounter.Load())
+	_, err = cc.Checksum(context.TODO(), ref, "/aa/root/aa/non-exist", ChecksumOpts{FollowLinks: true}, nil)
+	require.Error(t, err)
+	require.Equal(t, fullScanCounter, scanCounter.Load())
+	_, err = cc.Checksum(context.TODO(), ref, "/aa/root/bb/cc", ChecksumOpts{FollowLinks: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, fullScanCounter, scanCounter.Load())
+}
+
+func TestChecksumNonLexicalSymlinks(t *testing.T) {
+	t.Parallel()
+	tmpdir := t.TempDir()
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+	cm, cleanup := setupCacheManager(t, tmpdir, "native", snapshotter)
+	t.Cleanup(cleanup)
+
+	ch := []string{
+		"ADD target dir",
+		"ADD target/file file data0",
+		"ADD link1 dir",
+		"ADD link1/target_file symlink ../target/file",
+		"ADD link1/target_file_abs symlink /target/file",
+		"ADD link1/target_dir symlink ../target",
+		"ADD link1/target_dir_abs symlink /target",
+		"ADD link2 dir",
+		"ADD link2/link1_rel symlink ../link1",
+		"ADD link2/link1_abs symlink /link1",
+		"ADD link3 dir",
+		"ADD link3/target symlink ../link2/link1_rel/target_dir",
+		"ADD link3/target_file symlink ../link2/link1_rel/target_file",
+	}
+
+	ref := createRef(t, cm, ch)
+
+	cc, err := newCacheContext(ref)
+	require.NoError(t, err)
+
+	// When following links, all of these paths should be resolved identically.
+	for _, path := range []string{
+		"target/file",
+		"link1/target_file",
+		"link1/target_dir/file",
+		"link2/link1_rel/target_file",
+		"link2/link1_rel/target_file_abs",
+		"link2/link1_rel/target_dir/file",
+		"link2/link1_rel/target_dir_abs/file",
+		"link2/link1_abs/target_file",
+		"link2/link1_abs/target_file_abs",
+		"link2/link1_abs/target_dir/file",
+		"link2/link1_abs/target_dir_abs/file",
+		"link3/target_file",
+		"link3/target/file",
+	} {
+		dgst, err := cc.Checksum(context.TODO(), ref, path, ChecksumOpts{FollowLinks: true}, nil)
+		require.NoErrorf(t, err, "Checksum(%q)", path)
+		require.Equalf(t, dgstFileData0, dgst, "Checksum(%q)", path)
+	}
+
+	// FollowLinks only affects final component resolution, so make sure that
+	// the resolution still works with symlink path components.
+	for _, path := range []string{
+		"target/file",
+		"link1/target_dir/file",
+		"link2/link1_rel/target_dir/file",
+		"link2/link1_rel/target_dir_abs/file",
+		"link2/link1_abs/target_dir/file",
+		"link2/link1_abs/target_dir_abs/file",
+		"link3/target/file",
+	} {
+		dgst, err := cc.Checksum(context.TODO(), ref, path, ChecksumOpts{FollowLinks: false}, nil)
+		require.NoErrorf(t, err, "Checksum(%q)", path)
+		require.Equalf(t, dgstFileData0, dgst, "Checksum(%q)", path)
+	}
+
+	dgstLink1TargetFile, err := cc.Checksum(context.TODO(), ref, "link1/target_file", ChecksumOpts{FollowLinks: false}, nil)
+	require.NoError(t, err)
+	require.NotEqual(t, dgstFileData0, dgstLink1TargetFile)
+
+	dgstLink1TargetFileAbs, err := cc.Checksum(context.TODO(), ref, "link1/target_file_abs", ChecksumOpts{FollowLinks: false}, nil)
+	require.NoError(t, err)
+	require.NotEqual(t, dgstFileData0, dgstLink1TargetFileAbs)
+
+	dgstLink3TargetFile, err := cc.Checksum(context.TODO(), ref, "link3/target_file", ChecksumOpts{FollowLinks: false}, nil)
+	require.NoError(t, err)
+	require.NotEqual(t, dgstFileData0, dgstLink3TargetFile)
+
+	// For the final component, we should get the digest of the expected links.
+	for _, test := range []struct {
+		path         string
+		expectedDgst digest.Digest
+	}{
+		{"link1/target_file", dgstLink1TargetFile},
+		{"link2/link1_rel/target_file", dgstLink1TargetFile},
+		{"link2/link1_rel/target_file_abs", dgstLink1TargetFileAbs},
+		{"link2/link1_abs/target_file", dgstLink1TargetFile},
+		{"link2/link1_abs/target_file_abs", dgstLink1TargetFileAbs},
+		{"link3/target_file", dgstLink3TargetFile},
+	} {
+		dgst, err := cc.Checksum(context.TODO(), ref, test.path, ChecksumOpts{FollowLinks: false}, nil)
+		require.NoErrorf(t, err, "Checksum(%q)", test.path)
+		require.NotEqualf(t, dgstFileData0, dgst, "Checksum(%q)", test.path)
+		require.Equalf(t, test.expectedDgst, dgst, "Checksum(%q)", test.path)
+	}
 }
 
 func TestChecksumHardlinks(t *testing.T) {
@@ -871,7 +1120,7 @@ func TestChecksumUnorderedFiles(t *testing.T) {
 	dgst, err := cc.Checksum(context.TODO(), ref, "d0", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
-	require.Equal(t, dgst, digest.Digest("sha256:14276c302c940a80f82ca5477bf766c98a24702d6a9948ee71bb277cdad3ae05"))
+	require.Equal(t, digest.Digest("sha256:14276c302c940a80f82ca5477bf766c98a24702d6a9948ee71bb277cdad3ae05"), dgst)
 
 	// check regression from earier version that didn't track some files
 	ch = []string{
@@ -1079,19 +1328,19 @@ func TestSymlinkInPathHandleChange(t *testing.T) {
 
 	dgstFileData0, err := cc.Checksum(context.TODO(), ref, "sub/d0", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
-	require.Equal(t, dgstFileData0, dgstDirD0)
+	require.Equal(t, dgstDirD0, dgstFileData0)
 
 	dgstFileData0, err = cc.Checksum(context.TODO(), ref, "d1/def/baz", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
-	require.Equal(t, dgstFileData0, dgstDirD0)
+	require.Equal(t, dgstDirD0, dgstFileData0)
 
 	dgstFileData0, err = cc.Checksum(context.TODO(), ref, "d1/def/bay", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
-	require.Equal(t, dgstFileData0, dgstDirD0)
+	require.Equal(t, dgstDirD0, dgstFileData0)
 
 	dgstFileData0, err = cc.Checksum(context.TODO(), ref, "link", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
-	require.Equal(t, dgstFileData0, dgstDirD0)
+	require.Equal(t, dgstDirD0, dgstFileData0)
 
 	err = ref.Release(context.TODO())
 	require.NoError(t, err)

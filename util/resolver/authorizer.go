@@ -4,16 +4,17 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"maps"
 	"net/http"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/containerd/containerd/remotes/docker/auth"
 	remoteserrors "github.com/containerd/containerd/remotes/errors"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/buildkit/session"
 	sessionauth "github.com/moby/buildkit/session/auth"
 	log "github.com/moby/buildkit/util/bklog"
@@ -96,11 +97,9 @@ func (a *authHandlerNS) set(host, session string, h *authHandler) {
 }
 
 func (a *authHandlerNS) delete(h *authHandler) {
-	for k, v := range a.handlers {
-		if v == h {
-			delete(a.handlers, k)
-		}
-	}
+	maps.DeleteFunc(a.handlers, func(_ string, v *authHandler) bool {
+		return v == h
+	})
 }
 
 type dockerAuthorizer struct {
@@ -219,7 +218,7 @@ func (a *dockerAuthorizer) AddResponses(ctx context.Context, responses []*http.R
 			}
 		}
 	}
-	return errors.Wrap(errdefs.ErrNotImplemented, "failed to find supported auth scheme")
+	return errors.Wrap(cerrdefs.ErrNotImplemented, "failed to find supported auth scheme")
 }
 
 // authResult is used to control limit rate.
@@ -271,7 +270,7 @@ func (ah *authHandler) authorize(ctx context.Context, sm *session.Manager, g ses
 	case auth.BearerAuth:
 		return ah.doBearerAuth(ctx, sm, g)
 	default:
-		return "", errors.Wrapf(errdefs.ErrNotImplemented, "failed to find supported auth scheme: %s", string(ah.scheme))
+		return "", errors.Wrapf(cerrdefs.ErrNotImplemented, "failed to find supported auth scheme: %s", string(ah.scheme))
 	}
 }
 

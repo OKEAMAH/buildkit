@@ -30,13 +30,13 @@ import (
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/content/local"
 	"github.com/containerd/containerd/content/proxy"
-	ctderrdefs "github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/continuity/fs/fstest"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/containerd/platforms"
 	"github.com/distribution/reference"
 	intoto "github.com/in-toto/in-toto-golang/in_toto"
 	controlapi "github.com/moby/buildkit/api/services/control"
@@ -219,6 +219,7 @@ var allTests = []func(t *testing.T, sb integration.Sandbox){
 	testSolverOptLocalDirsStillWorks,
 	testOCIIndexMediatype,
 	testLayerLimitOnMounts,
+	testFrontendVerifyPlatforms,
 }
 
 func TestIntegration(t *testing.T) {
@@ -491,12 +492,12 @@ func testExportedImageLabels(t *testing.T, sb integration.Sandbox) {
 	// layers should be deleted
 	_, err = store.Info(ctx, mfst.Layers[1].Digest)
 	require.Error(t, err)
-	require.True(t, errors.Is(err, ctderrdefs.ErrNotFound))
+	require.True(t, errors.Is(err, cerrdefs.ErrNotFound))
 
 	// config should be deleted
 	_, err = store.Info(ctx, mfst.Config.Digest)
 	require.Error(t, err)
-	require.True(t, errors.Is(err, ctderrdefs.ErrNotFound))
+	require.True(t, errors.Is(err, cerrdefs.ErrNotFound))
 
 	// buildkit contentstore still has the layer because it is multi-ns
 	bkstore := proxy.NewContentStore(c.ContentClient())
@@ -944,7 +945,7 @@ func testCgroupParent(t *testing.T, sb integration.Sandbox) {
 
 	dt, err = os.ReadFile(filepath.Join(destDir, "second.error"))
 	require.NoError(t, err)
-	require.Equal(t, strings.TrimSpace(string(dt)), "")
+	require.Equal(t, "", strings.TrimSpace(string(dt)))
 }
 
 func testNetworkMode(t *testing.T, sb integration.Sandbox) {
@@ -1018,7 +1019,7 @@ func testPushByDigest(t *testing.T, sb integration.Sandbox) {
 
 	require.Equal(t, resp.ExporterResponse[exptypes.ExporterImageDigestKey], desc.Digest.String())
 	require.Equal(t, images.MediaTypeDockerSchema2Manifest, desc.MediaType)
-	require.True(t, desc.Size > 0)
+	require.Greater(t, desc.Size, int64(0))
 }
 
 func testSecurityMode(t *testing.T, sb integration.Sandbox) {
@@ -2553,7 +2554,7 @@ func testBuildExportScratch(t *testing.T, sb integration.Sandbox) {
 	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
 	require.NoError(t, err)
 	require.Len(t, imgs.Images, 1)
-	img := imgs.Find(platforms.DefaultString())
+	img := imgs.Find(platforms.Format(platforms.DefaultSpec()))
 	require.Empty(t, img.Layers)
 	require.Equal(t, platforms.DefaultSpec(), img.Img.Platform)
 
@@ -2610,8 +2611,8 @@ func testBuildHTTPSource(t *testing.T, sb integration.Sandbox) {
 	_, err = c.Solve(sb.Context(), def, SolveOpt{}, nil)
 	require.NoError(t, err)
 
-	require.Equal(t, server.Stats("/foo").AllRequests, 1)
-	require.Equal(t, server.Stats("/foo").CachedRequests, 0)
+	require.Equal(t, 1, server.Stats("/foo").AllRequests)
+	require.Equal(t, 0, server.Stats("/foo").CachedRequests)
 
 	tmpdir := t.TempDir()
 
@@ -2625,8 +2626,8 @@ func testBuildHTTPSource(t *testing.T, sb integration.Sandbox) {
 	}, nil)
 	require.NoError(t, err)
 
-	require.Equal(t, server.Stats("/foo").AllRequests, 2)
-	require.Equal(t, server.Stats("/foo").CachedRequests, 1)
+	require.Equal(t, 2, server.Stats("/foo").AllRequests)
+	require.Equal(t, 1, server.Stats("/foo").CachedRequests)
 
 	dt, err := os.ReadFile(filepath.Join(tmpdir, "foo"))
 	require.NoError(t, err)
@@ -2668,8 +2669,8 @@ func testBuildHTTPSource(t *testing.T, sb integration.Sandbox) {
 	}, nil)
 	require.NoError(t, err)
 
-	require.Equal(t, server.Stats("/foo").AllRequests, 4)
-	require.Equal(t, server.Stats("/foo").CachedRequests, 1)
+	require.Equal(t, 4, server.Stats("/foo").AllRequests)
+	require.Equal(t, 1, server.Stats("/foo").CachedRequests)
 
 	dt, err = os.ReadFile(filepath.Join(tmpdir, "foo"))
 	require.NoError(t, err)
@@ -2698,8 +2699,8 @@ func testBuildHTTPSource(t *testing.T, sb integration.Sandbox) {
 	}, nil)
 	require.NoError(t, err)
 
-	require.Equal(t, server.Stats("/foo").AllRequests, 5)
-	require.Equal(t, server.Stats("/foo").CachedRequests, 1)
+	require.Equal(t, 5, server.Stats("/foo").AllRequests)
+	require.Equal(t, 1, server.Stats("/foo").CachedRequests)
 
 	dt, err = os.ReadFile(filepath.Join(tmpdir, "bar"))
 	require.NoError(t, err)
@@ -2708,7 +2709,7 @@ func testBuildHTTPSource(t *testing.T, sb integration.Sandbox) {
 	fi, err := os.Stat(filepath.Join(tmpdir, "bar"))
 	require.NoError(t, err)
 	require.Equal(t, fi.ModTime().Format(http.TimeFormat), modTime.Format(http.TimeFormat))
-	require.Equal(t, int(fi.Mode()&0777), 0741)
+	require.Equal(t, 0741, int(fi.Mode()&0777))
 
 	checkAllReleasable(t, c, sb, true)
 
@@ -2939,6 +2940,7 @@ func testMultipleExporters(t *testing.T, sb integration.Sandbox) {
 
 		if workers.IsTestDockerd() {
 			require.Len(t, ev.Record.Result.Results, 1)
+			require.Len(t, ev.Record.Exporters, 5)
 			if workers.IsTestDockerdMoby(sb) {
 				require.Equal(t, images.MediaTypeDockerSchema2Config, ev.Record.Result.Results[0].MediaType)
 			} else {
@@ -2946,6 +2948,7 @@ func testMultipleExporters(t *testing.T, sb integration.Sandbox) {
 			}
 		} else {
 			require.Len(t, ev.Record.Result.Results, 2)
+			require.Len(t, ev.Record.Exporters, 6)
 			require.Equal(t, images.MediaTypeDockerSchema2Manifest, ev.Record.Result.Results[0].MediaType)
 			require.Equal(t, ocispecs.MediaTypeImageManifest, ev.Record.Result.Results[1].MediaType)
 		}
@@ -3287,7 +3290,7 @@ func testSourceDateEpochLayerTimestamps(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 	tms := tmsX.FromImage
 
-	require.Equal(t, len(tms), 3)
+	require.Equal(t, 3, len(tms))
 
 	expected := tm.UTC().Format(time.RFC3339Nano)
 	require.Equal(t, expected, tms[0])
@@ -3354,7 +3357,7 @@ func testSourceDateEpochClamp(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 	busyboxTms := busyboxTmsX.FromImage
 
-	require.True(t, len(busyboxTms) > 1)
+	require.Greater(t, len(busyboxTms), 1)
 	bboxLayerLen := len(busyboxTms) - 1
 
 	tm, err := time.Parse(time.RFC3339Nano, busyboxTms[1])
@@ -3457,7 +3460,7 @@ func testSourceDateEpochReset(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 	tms := tmsX.FromImage
 
-	require.Equal(t, len(tms), 3)
+	require.Equal(t, 3, len(tms))
 
 	expected := tm.UTC().Format(time.RFC3339Nano)
 	require.NotEqual(t, expected, tms[0])
@@ -3569,7 +3572,7 @@ func testSourceDateEpochTarExporter(t *testing.T, sb integration.Sandbox) {
 	m, err := testutil.ReadTarToMap(dt, false)
 	require.NoError(t, err)
 
-	require.Equal(t, len(m), 2)
+	require.Equal(t, 2, len(m))
 
 	require.Equal(t, tm.Format(time.RFC3339), m["foo"].Header.ModTime.Format(time.RFC3339))
 	require.Equal(t, tm.Format(time.RFC3339), m["bar"].Header.ModTime.Format(time.RFC3339))
@@ -3677,7 +3680,7 @@ func testFrontendMetadataReturn(t *testing.T, sb integration.Sandbox) {
 	}, "", frontend, nil)
 	require.NoError(t, err)
 	require.Contains(t, res.ExporterResponse, "frontend.returned")
-	require.Equal(t, res.ExporterResponse["frontend.returned"], "true")
+	require.Equal(t, "true", res.ExporterResponse["frontend.returned"])
 	require.NotContains(t, res.ExporterResponse, "not-frontend.not-returned")
 	require.NotContains(t, res.ExporterResponse, "frontendnot.returned.either")
 	checkAllReleasable(t, c, sb, true)
@@ -3859,12 +3862,12 @@ func testTarExporterSymlink(t *testing.T, sb integration.Sandbox) {
 
 	item, ok := m["foo"]
 	require.True(t, ok)
-	require.Equal(t, int32(item.Header.Typeflag), tar.TypeReg)
+	require.Equal(t, tar.TypeReg, int32(item.Header.Typeflag))
 	require.Equal(t, []byte("first"), item.Data)
 
 	item, ok = m["bar"]
 	require.True(t, ok)
-	require.Equal(t, int32(item.Header.Typeflag), tar.TypeSymlink)
+	require.Equal(t, tar.TypeSymlink, int32(item.Header.Typeflag))
 	require.Equal(t, "foo", item.Header.Linkname)
 }
 
@@ -3925,7 +3928,7 @@ func testBuildExportWithForeignLayer(t *testing.T, sb integration.Sandbox) {
 		// The request is only made when we attempt to read from the reader.
 		buf := make([]byte, 1)
 		_, err = rc.Read(buf)
-		require.Truef(t, ctderrdefs.IsNotFound(err), "expected error for blob that should not be in registry: %s, %v", mfst.Layers[0].Digest, err)
+		require.Truef(t, cerrdefs.IsNotFound(err), "expected error for blob that should not be in registry: %s, %v", mfst.Layers[0].Digest, err)
 	})
 	t.Run("propagate=0", func(t *testing.T) {
 		registry, err := sb.NewRegistry()
@@ -4107,7 +4110,7 @@ func testBuildExportWithUncompressed(t *testing.T, sb integration.Sandbox) {
 
 	item, ok := m["data"]
 	require.True(t, ok)
-	require.Equal(t, int32(item.Header.Typeflag), tar.TypeReg)
+	require.Equal(t, tar.TypeReg, int32(item.Header.Typeflag))
 	require.Equal(t, []byte("uncompressed"), item.Data)
 
 	dt, err = content.ReadBlob(ctx, img.ContentStore(), ocispecs.Descriptor{Digest: mfst.Layers[1].Digest})
@@ -4118,7 +4121,7 @@ func testBuildExportWithUncompressed(t *testing.T, sb integration.Sandbox) {
 
 	item, ok = m["data"]
 	require.True(t, ok)
-	require.Equal(t, int32(item.Header.Typeflag), tar.TypeReg)
+	require.Equal(t, tar.TypeReg, int32(item.Header.Typeflag))
 	require.Equal(t, []byte("gzip"), item.Data)
 
 	err = client.ImageService().Delete(ctx, compressedTarget, images.SynchronousDelete())
@@ -4152,7 +4155,7 @@ func testBuildExportWithUncompressed(t *testing.T, sb integration.Sandbox) {
 
 	item, ok = m["data"]
 	require.True(t, ok)
-	require.Equal(t, int32(item.Header.Typeflag), tar.TypeReg)
+	require.Equal(t, tar.TypeReg, int32(item.Header.Typeflag))
 	require.Equal(t, []byte("uncompressed"), item.Data)
 
 	dt, err = content.ReadBlob(ctx, img.ContentStore(), ocispecs.Descriptor{Digest: mfst.Layers[1].Digest})
@@ -4163,7 +4166,7 @@ func testBuildExportWithUncompressed(t *testing.T, sb integration.Sandbox) {
 
 	item, ok = m["data"]
 	require.True(t, ok)
-	require.Equal(t, int32(item.Header.Typeflag), tar.TypeReg)
+	require.Equal(t, tar.TypeReg, int32(item.Header.Typeflag))
 	require.Equal(t, []byte("gzip"), item.Data)
 }
 
@@ -4226,7 +4229,7 @@ func testBuildExportZstd(t *testing.T, sb integration.Sandbox) {
 	require.Equal(t, ocispecs.MediaTypeImageLayer+"+zstd", lastLayer.MediaType)
 
 	zstdLayerDigest := lastLayer.Digest.Hex()
-	require.Equal(t, m[ocispecs.ImageBlobsDir+"/sha256/"+zstdLayerDigest].Data[:4], []byte{0x28, 0xb5, 0x2f, 0xfd})
+	require.Equal(t, []byte{0x28, 0xb5, 0x2f, 0xfd}, m[ocispecs.ImageBlobsDir+"/sha256/"+zstdLayerDigest].Data[:4])
 
 	// repeat without oci mediatype
 	outW, err = os.Create(out)
@@ -4353,7 +4356,7 @@ func testPullZstdImage(t *testing.T, sb integration.Sandbox) {
 			}
 
 			zstdLayerDigest := firstLayer.Digest.Hex()
-			require.Equal(t, m[ocispecs.ImageBlobsDir+"/sha256/"+zstdLayerDigest].Data[:4], []byte{0x28, 0xb5, 0x2f, 0xfd})
+			require.Equal(t, []byte{0x28, 0xb5, 0x2f, 0xfd}, m[ocispecs.ImageBlobsDir+"/sha256/"+zstdLayerDigest].Data[:4])
 		})
 	}
 }
@@ -4475,7 +4478,7 @@ func testBuildPushAndValidate(t *testing.T, sb integration.Sandbox) {
 	require.Equal(t, "layers", ociimg.RootFS.Type)
 	require.Equal(t, 3, len(ociimg.RootFS.DiffIDs))
 	require.NotNil(t, ociimg.Created)
-	require.True(t, time.Since(*ociimg.Created) < 2*time.Minute)
+	require.Less(t, time.Since(*ociimg.Created), 2*time.Minute)
 	require.Condition(t, func() bool {
 		for _, env := range ociimg.Config.Env {
 			if strings.HasPrefix(env, "PATH=") {
@@ -4517,16 +4520,16 @@ func testBuildPushAndValidate(t *testing.T, sb integration.Sandbox) {
 
 	item, ok := m["foo/"]
 	require.True(t, ok)
-	require.Equal(t, int32(item.Header.Typeflag), tar.TypeDir)
+	require.Equal(t, tar.TypeDir, int32(item.Header.Typeflag))
 	require.Equal(t, 0741, int(item.Header.Mode&0777))
 
 	item, ok = m["foo/sub/"]
 	require.True(t, ok)
-	require.Equal(t, int32(item.Header.Typeflag), tar.TypeDir)
+	require.Equal(t, tar.TypeDir, int32(item.Header.Typeflag))
 
 	item, ok = m["foo/sub/bar"]
 	require.True(t, ok)
-	require.Equal(t, int32(item.Header.Typeflag), tar.TypeReg)
+	require.Equal(t, tar.TypeReg, int32(item.Header.Typeflag))
 	require.Equal(t, []byte("first"), item.Data)
 
 	_, ok = m["foo/sub/baz"]
@@ -4540,17 +4543,17 @@ func testBuildPushAndValidate(t *testing.T, sb integration.Sandbox) {
 
 	item, ok = m["foo/sub/baz"]
 	require.True(t, ok)
-	require.Equal(t, int32(item.Header.Typeflag), tar.TypeReg)
+	require.Equal(t, tar.TypeReg, int32(item.Header.Typeflag))
 	require.Equal(t, []byte("second"), item.Data)
 
 	item, ok = m["foo/"]
 	require.True(t, ok)
-	require.Equal(t, int32(item.Header.Typeflag), tar.TypeDir)
+	require.Equal(t, tar.TypeDir, int32(item.Header.Typeflag))
 	require.Equal(t, 0741, int(item.Header.Mode&0777))
 
 	item, ok = m["foo/sub/"]
 	require.True(t, ok)
-	require.Equal(t, int32(item.Header.Typeflag), tar.TypeDir)
+	require.Equal(t, tar.TypeDir, int32(item.Header.Typeflag))
 
 	_, ok = m["foo/sub/bar"]
 	require.False(t, ok)
@@ -4664,7 +4667,7 @@ func testStargzLazyRegistryCacheImportExport(t *testing.T, sb integration.Sandbo
 	require.NoError(t, err)
 
 	dgst, ok := resp.ExporterResponse[exptypes.ExporterImageDigestKey]
-	require.Equal(t, ok, true)
+	require.Equal(t, true, ok)
 
 	unique, err := readFileInImage(sb.Context(), t, c, target+"@"+dgst, "/unique")
 	require.NoError(t, err)
@@ -4680,7 +4683,7 @@ func testStargzLazyRegistryCacheImportExport(t *testing.T, sb integration.Sandbo
 	var sgzLayers []ocispecs.Descriptor
 	for i, layer := range manifest.Layers[:len(manifest.Layers)-1] {
 		_, err = contentStore.Info(ctx, layer.Digest)
-		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v on layer %+v (%d)", err, layer, i)
+		require.ErrorIs(t, err, cerrdefs.ErrNotFound, "unexpected error %v on layer %+v (%d)", err, layer, i)
 		sgzLayers = append(sgzLayers, layer)
 	}
 	require.NotEqual(t, 0, len(sgzLayers), "no layer can be used for checking lazypull")
@@ -4715,7 +4718,7 @@ func testStargzLazyRegistryCacheImportExport(t *testing.T, sb integration.Sandbo
 	require.NoError(t, err)
 
 	dgst2, ok := resp.ExporterResponse[exptypes.ExporterImageDigestKey]
-	require.Equal(t, ok, true)
+	require.Equal(t, true, ok)
 
 	unique2, err := readFileInImage(sb.Context(), t, c, target+"@"+dgst2, "/unique")
 	require.NoError(t, err)
@@ -4870,7 +4873,7 @@ func testStargzLazyInlineCacheImportExport(t *testing.T, sb integration.Sandbox)
 	var sgzLayers []ocispecs.Descriptor
 	for i, layer := range manifest.Layers[:len(manifest.Layers)-1] {
 		_, err = contentStore.Info(ctx, layer.Digest)
-		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v on layer %+v (%d)", err, layer, i)
+		require.ErrorIs(t, err, cerrdefs.ErrNotFound, "unexpected error %v on layer %+v (%d)", err, layer, i)
 		sgzLayers = append(sgzLayers, layer)
 	}
 	require.NotEqual(t, 0, len(sgzLayers), "no layer can be used for checking lazypull")
@@ -4992,7 +4995,7 @@ func testStargzLazyPull(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 
 	dgst, ok := resp.ExporterResponse[exptypes.ExporterImageDigestKey]
-	require.Equal(t, ok, true)
+	require.Equal(t, true, ok)
 
 	unique, err := readFileInImage(sb.Context(), t, c, target+"@"+dgst, "/unique")
 	require.NoError(t, err)
@@ -5008,7 +5011,7 @@ func testStargzLazyPull(t *testing.T, sb integration.Sandbox) {
 	var sgzLayers []ocispecs.Descriptor
 	for _, layer := range manifest.Layers[:len(manifest.Layers)-1] {
 		_, err = contentStore.Info(ctx, layer.Digest)
-		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v", err)
+		require.ErrorIs(t, err, cerrdefs.ErrNotFound, "unexpected error %v", err)
 		sgzLayers = append(sgzLayers, layer)
 	}
 	require.NotEqual(t, 0, len(sgzLayers), "no layer can be used for checking lazypull")
@@ -5035,7 +5038,7 @@ func testStargzLazyPull(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 
 	dgst2, ok := resp.ExporterResponse[exptypes.ExporterImageDigestKey]
-	require.Equal(t, ok, true)
+	require.Equal(t, true, ok)
 
 	unique2, err := readFileInImage(sb.Context(), t, c, target+"@"+dgst2, "/unique")
 	require.NoError(t, err)
@@ -5166,7 +5169,7 @@ func testLazyImagePush(t *testing.T, sb integration.Sandbox) {
 
 	for _, layer := range manifest.Layers {
 		_, err = contentStore.Info(ctx, layer.Digest)
-		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v", err)
+		require.ErrorIs(t, err, cerrdefs.ErrNotFound, "unexpected error %v", err)
 	}
 
 	// clear all local state out again
@@ -5200,7 +5203,7 @@ func testLazyImagePush(t *testing.T, sb integration.Sandbox) {
 
 	for _, layer := range manifest.Layers {
 		_, err = contentStore.Info(ctx, layer.Digest)
-		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v", err)
+		require.ErrorIs(t, err, cerrdefs.ErrNotFound, "unexpected error %v", err)
 	}
 
 	// check that a subsequent build can use the previously lazy image in an exec
@@ -5268,7 +5271,7 @@ func testZstdLocalCacheExport(t *testing.T, sb integration.Sandbox) {
 	zstdLayerDigest := lastLayer.Digest.Hex()
 	dt, err = os.ReadFile(filepath.Join(destDir, ocispecs.ImageBlobsDir+"/sha256/"+zstdLayerDigest))
 	require.NoError(t, err)
-	require.Equal(t, dt[:4], []byte{0x28, 0xb5, 0x2f, 0xfd})
+	require.Equal(t, []byte{0x28, 0xb5, 0x2f, 0xfd}, dt[:4])
 }
 
 func testCacheExportIgnoreError(t *testing.T, sb integration.Sandbox) {
@@ -5560,7 +5563,7 @@ func testBasicCacheImportExport(t *testing.T, sb integration.Sandbox, cacheOptio
 
 	dt, err := os.ReadFile(filepath.Join(destDir, "const"))
 	require.NoError(t, err)
-	require.Equal(t, string(dt), "foobar")
+	require.Equal(t, "foobar", string(dt))
 
 	dt, err = os.ReadFile(filepath.Join(destDir, "unique"))
 	require.NoError(t, err)
@@ -5582,7 +5585,7 @@ func testBasicCacheImportExport(t *testing.T, sb integration.Sandbox, cacheOptio
 
 	dt2, err := os.ReadFile(filepath.Join(destDir, "const"))
 	require.NoError(t, err)
-	require.Equal(t, string(dt2), "foobar")
+	require.Equal(t, "foobar", string(dt2))
 
 	dt2, err = os.ReadFile(filepath.Join(destDir, "unique"))
 	require.NoError(t, err)
@@ -5791,7 +5794,7 @@ func testBasicInlineCacheImportExport(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 
 	dgst, ok := resp.ExporterResponse[exptypes.ExporterImageDigestKey]
-	require.Equal(t, ok, true)
+	require.Equal(t, true, ok)
 
 	unique, err := readFileInImage(sb.Context(), t, c, target+"@"+dgst, "/unique")
 	require.NoError(t, err)
@@ -5828,7 +5831,7 @@ func testBasicInlineCacheImportExport(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 
 	dgst2, ok := resp.ExporterResponse[exptypes.ExporterImageDigestKey]
-	require.Equal(t, ok, true)
+	require.Equal(t, true, ok)
 
 	require.Equal(t, dgst, dgst2)
 
@@ -5866,7 +5869,7 @@ func testBasicInlineCacheImportExport(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 
 	dgst2uncompress, ok := resp.ExporterResponse[exptypes.ExporterImageDigestKey]
-	require.Equal(t, ok, true)
+	require.Equal(t, true, ok)
 
 	// dgst2uncompress != dgst, because the compression type is different
 	unique2uncompress, err := readFileInImage(sb.Context(), t, c, target+"@"+dgst2uncompress, "/unique")
@@ -5897,7 +5900,7 @@ func testBasicInlineCacheImportExport(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 
 	dgst3, ok := resp.ExporterResponse[exptypes.ExporterImageDigestKey]
-	require.Equal(t, ok, true)
+	require.Equal(t, true, ok)
 
 	// dgst3 != dgst, because inline cache is not exported for dgst3
 	unique3, err := readFileInImage(sb.Context(), t, c, target+"@"+dgst3, "/unique")
@@ -6005,7 +6008,7 @@ func testRegistryEmptyCacheExport(t *testing.T, sb integration.Sandbox) {
 					defer client.Close()
 
 					_, err := client.Fetch(ctx, cacheTarget)
-					require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v", err)
+					require.ErrorIs(t, err, cerrdefs.ErrNotFound, "unexpected error %v", err)
 				}
 			})
 		}
@@ -6294,6 +6297,7 @@ func testExportLocalNoPlatformSplit(t *testing.T, sb integration.Sandbox) {
 }
 
 func testExportLocalNoPlatformSplitOverwrite(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	workers.CheckFeatureCompat(t, sb, workers.FeatureOCIExporter, workers.FeatureMultiPlatform)
 	c, err := New(sb.Context(), sb.Address())
 	require.NoError(t, err)
@@ -6433,15 +6437,15 @@ func testCachedMounts(t *testing.T, sb integration.Sandbox) {
 
 	dt, err := os.ReadFile(filepath.Join(destDir, "foo"))
 	require.NoError(t, err)
-	require.Equal(t, string(dt), "first")
+	require.Equal(t, "first", string(dt))
 
 	dt, err = os.ReadFile(filepath.Join(destDir, "bar"))
 	require.NoError(t, err)
-	require.Equal(t, string(dt), "second")
+	require.Equal(t, "second", string(dt))
 
 	dt, err = os.ReadFile(filepath.Join(destDir, "baz"))
 	require.NoError(t, err)
-	require.Equal(t, string(dt), "base")
+	require.Equal(t, "base", string(dt))
 
 	checkAllReleasable(t, c, sb, true)
 }
@@ -7106,7 +7110,7 @@ func testProxyEnv(t *testing.T, sb integration.Sandbox) {
 
 	dt, err := os.ReadFile(filepath.Join(destDir, "env"))
 	require.NoError(t, err)
-	require.Equal(t, string(dt), "httpvalue-httpsvalue-noproxyvalue-noproxyvalue-allproxyvalue-allproxyvalue")
+	require.Equal(t, "httpvalue-httpsvalue-noproxyvalue-noproxyvalue-allproxyvalue-allproxyvalue", string(dt))
 
 	// repeat to make sure proxy doesn't change cache
 	st = base.Run(llb.Shlex(cmd), llb.WithProxy(llb.ProxyEnv{
@@ -7132,7 +7136,7 @@ func testProxyEnv(t *testing.T, sb integration.Sandbox) {
 
 	dt, err = os.ReadFile(filepath.Join(destDir, "env"))
 	require.NoError(t, err)
-	require.Equal(t, string(dt), "httpvalue-httpsvalue-noproxyvalue-noproxyvalue-allproxyvalue-allproxyvalue")
+	require.Equal(t, "httpvalue-httpsvalue-noproxyvalue-noproxyvalue-allproxyvalue-allproxyvalue", string(dt))
 }
 
 func testMergeOp(t *testing.T, sb integration.Sandbox) {
@@ -7316,7 +7320,7 @@ func testMergeOpCache(t *testing.T, sb integration.Sandbox, mode string) {
 
 	for _, layer := range busyboxManifest.Layers {
 		_, err = contentStore.Info(ctx, layer.Digest)
-		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v", err)
+		require.ErrorIs(t, err, cerrdefs.ErrNotFound, "unexpected error %v", err)
 	}
 
 	// make a new merge that includes the lazy busybox as a base and exports inline cache
@@ -7402,7 +7406,7 @@ func testMergeOpCache(t *testing.T, sb integration.Sandbox, mode string) {
 	// verify that the busybox image stayed lazy
 	for _, layer := range busyboxManifest.Layers {
 		_, err = contentStore.Info(ctx, layer.Digest)
-		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v", err)
+		require.ErrorIs(t, err, cerrdefs.ErrNotFound, "unexpected error %v", err)
 	}
 
 	// get the random value at /bar/2
@@ -7434,7 +7438,7 @@ func testMergeOpCache(t *testing.T, sb integration.Sandbox, mode string) {
 
 	for _, layer := range manifest.Layers {
 		_, err = contentStore.Info(ctx, layer.Digest)
-		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v", err)
+		require.ErrorIs(t, err, cerrdefs.ErrNotFound, "unexpected error %v", err)
 	}
 
 	// re-run the same build with cache imports and verify everything stays lazy
@@ -7462,7 +7466,7 @@ func testMergeOpCache(t *testing.T, sb integration.Sandbox, mode string) {
 
 	for i, layer := range manifest.Layers {
 		_, err = contentStore.Info(ctx, layer.Digest)
-		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v for index %d (%s)", err, i, layer.Digest)
+		require.ErrorIs(t, err, cerrdefs.ErrNotFound, "unexpected error %v for index %d (%s)", err, i, layer.Digest)
 	}
 
 	// re-run the build with a change only to input1 using the remote cache
@@ -7503,7 +7507,7 @@ func testMergeOpCache(t *testing.T, sb integration.Sandbox, mode string) {
 		case 0, 2:
 			// bottom and top layer should stay lazy as they didn't change
 			_, err = contentStore.Info(ctx, layer.Digest)
-			require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v for index %d", err, i)
+			require.ErrorIs(t, err, cerrdefs.ErrNotFound, "unexpected error %v for index %d", err, i)
 		case 1:
 			// middle layer had to be rebuilt, should exist locally
 			_, err = contentStore.Info(ctx, layer.Digest)
@@ -7539,7 +7543,7 @@ func testMergeOpCache(t *testing.T, sb integration.Sandbox, mode string) {
 
 	for _, layer := range manifest.Layers {
 		_, err = contentStore.Info(ctx, layer.Digest)
-		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v", err)
+		require.ErrorIs(t, err, cerrdefs.ErrNotFound, "unexpected error %v", err)
 	}
 
 	mergePlusLayer := merge.File(llb.Mkfile("/3", 0444, nil))
@@ -7588,7 +7592,7 @@ func testMergeOpCache(t *testing.T, sb integration.Sandbox, mode string) {
 
 	for _, layer := range manifest.Layers {
 		_, err = contentStore.Info(ctx, layer.Digest)
-		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v", err)
+		require.ErrorIs(t, err, cerrdefs.ErrNotFound, "unexpected error %v", err)
 	}
 
 	_, err = c.Solve(sb.Context(), def, SolveOpt{
@@ -7614,7 +7618,7 @@ func testMergeOpCache(t *testing.T, sb integration.Sandbox, mode string) {
 
 	for i, layer := range manifest.Layers {
 		_, err = contentStore.Info(ctx, layer.Digest)
-		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v for index %d", err, i)
+		require.ErrorIs(t, err, cerrdefs.ErrNotFound, "unexpected error %v for index %d", err, i)
 	}
 }
 
@@ -7766,7 +7770,7 @@ func checkAllReleasable(t *testing.T, c *Client, sb integration.Sandbox, checkCo
 	retries := 0
 loop0:
 	for {
-		require.True(t, 20 > retries)
+		require.Greater(t, 20, retries)
 		retries++
 		du, err := c.DiskUsage(sb.Context())
 		require.NoError(t, err)
@@ -7814,7 +7818,7 @@ loop0:
 		if count == 0 {
 			break
 		}
-		require.True(t, 20 > retries)
+		require.Less(t, retries, 20)
 		retries++
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -8067,11 +8071,11 @@ func testPullWithLayerLimit(t *testing.T, sb integration.Sandbox) {
 
 	dt, err := os.ReadFile(filepath.Join(destDir, "first"))
 	require.NoError(t, err)
-	require.Equal(t, string(dt), "first")
+	require.Equal(t, "first", string(dt))
 
 	dt, err = os.ReadFile(filepath.Join(destDir, "second"))
 	require.NoError(t, err)
-	require.Equal(t, string(dt), "second")
+	require.Equal(t, "second", string(dt))
 
 	_, err = os.ReadFile(filepath.Join(destDir, "third"))
 	require.Error(t, err)
@@ -8079,7 +8083,7 @@ func testPullWithLayerLimit(t *testing.T, sb integration.Sandbox) {
 
 	dt, err = os.ReadFile(filepath.Join(destDir, "forth"))
 	require.NoError(t, err)
-	require.Equal(t, string(dt), "forth")
+	require.Equal(t, "forth", string(dt))
 
 	// pull 3rd layer only
 	st = llb.Diff(
@@ -8110,11 +8114,11 @@ func testPullWithLayerLimit(t *testing.T, sb integration.Sandbox) {
 
 	dt, err = os.ReadFile(filepath.Join(destDir, "third"))
 	require.NoError(t, err)
-	require.Equal(t, string(dt), "third")
+	require.Equal(t, "third", string(dt))
 
 	dt, err = os.ReadFile(filepath.Join(destDir, "forth"))
 	require.NoError(t, err)
-	require.Equal(t, string(dt), "forth")
+	require.Equal(t, "forth", string(dt))
 
 	// zero limit errors cleanly
 	st = llb.Image(target, llb.WithLayerLimit(0))
@@ -8128,6 +8132,7 @@ func testPullWithLayerLimit(t *testing.T, sb integration.Sandbox) {
 }
 
 func testCallInfo(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	workers.CheckFeatureCompat(t, sb, workers.FeatureInfo)
 	c, err := New(sb.Context(), sb.Address())
 	require.NoError(t, err)
@@ -8689,7 +8694,7 @@ func testExportAttestations(t *testing.T, sb integration.Sandbox) {
 			require.Equal(t, bases[i].Desc.Digest.String(), att.Desc.Annotations[attestation.DockerAnnotationReferenceDigest])
 			require.Equal(t, 2, len(att.Layers))
 			require.Equal(t, len(att.Layers), len(att.Img.RootFS.DiffIDs))
-			require.Equal(t, len(att.Img.History), 0)
+			require.Equal(t, 0, len(att.Img.History))
 
 			var attest intoto.Statement
 			require.NoError(t, json.Unmarshal(att.LayersRaw[0], &attest))
@@ -9745,9 +9750,9 @@ func testSBOMSupplements(t *testing.T, sb integration.Sandbox) {
 
 	require.Equal(t, "DOCUMENT", string(attest.Predicate.SPDXIdentifier))
 	require.Len(t, attest.Predicate.Files, 2)
-	require.Equal(t, attest.Predicate.Files[0].FileName, "/foo")
+	require.Equal(t, "/foo", attest.Predicate.Files[0].FileName)
 	require.Regexp(t, "^layerID: sha256:", attest.Predicate.Files[0].FileComment)
-	require.Equal(t, attest.Predicate.Files[1].FileName, "/bar")
+	require.Equal(t, "/bar", attest.Predicate.Files[1].FileName)
 	require.Empty(t, attest.Predicate.Files[1].FileComment)
 }
 
@@ -9997,6 +10002,166 @@ func testMountStubsTimestamp(t *testing.T, sb integration.Sandbox) {
 		require.NotNil(t, hd, name)
 		require.Equal(t, sourceDateEpoch, hd.ModTime.Unix(), name)
 	}
+}
+
+func testFrontendVerifyPlatforms(t *testing.T, sb integration.Sandbox) {
+	requiresLinux(t)
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		st := llb.Scratch().File(
+			llb.Mkfile("foo", 0600, []byte("data")),
+		)
+
+		def, err := st.Marshal(sb.Context())
+		if err != nil {
+			return nil, err
+		}
+
+		return c.Solve(ctx, gateway.SolveRequest{
+			Definition: def.ToPB(),
+		})
+	}
+
+	wc := newWarningsCapture()
+	_, err = c.Build(sb.Context(), SolveOpt{
+		FrontendAttrs: map[string]string{
+			"platform": "linux/amd64,linux/arm64",
+		},
+	}, "", frontend, wc.status)
+	require.NoError(t, err)
+	warnings := wc.wait()
+
+	require.Len(t, warnings, 1)
+	require.Contains(t, string(warnings[0].Short), "Multiple platforms requested but result is not multi-platform")
+
+	wc = newWarningsCapture()
+	_, err = c.Build(sb.Context(), SolveOpt{
+		FrontendAttrs: map[string]string{},
+	}, "", frontend, wc.status)
+	require.NoError(t, err)
+
+	warnings = wc.wait()
+	require.Len(t, warnings, 0)
+
+	frontend = func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		res := gateway.NewResult()
+		platformsToTest := []string{"linux/amd64", "linux/arm64"}
+		expPlatforms := &exptypes.Platforms{
+			Platforms: make([]exptypes.Platform, len(platformsToTest)),
+		}
+		for i, platform := range platformsToTest {
+			st := llb.Scratch().File(
+				llb.Mkfile("platform", 0600, []byte(platform)),
+			)
+
+			def, err := st.Marshal(ctx)
+			if err != nil {
+				return nil, err
+			}
+
+			r, err := c.Solve(ctx, gateway.SolveRequest{
+				Definition: def.ToPB(),
+			})
+			if err != nil {
+				return nil, err
+			}
+
+			ref, err := r.SingleRef()
+			if err != nil {
+				return nil, err
+			}
+
+			_, err = ref.ToState()
+			if err != nil {
+				return nil, err
+			}
+			res.AddRef(platform, ref)
+
+			expPlatforms.Platforms[i] = exptypes.Platform{
+				ID:       platform,
+				Platform: platforms.MustParse(platform),
+			}
+		}
+		dt, err := json.Marshal(expPlatforms)
+		if err != nil {
+			return nil, err
+		}
+		res.AddMeta(exptypes.ExporterPlatformsKey, dt)
+
+		return res, nil
+	}
+
+	wc = newWarningsCapture()
+	_, err = c.Build(sb.Context(), SolveOpt{
+		FrontendAttrs: map[string]string{
+			"platform": "linux/amd64,linux/arm64",
+		},
+	}, "", frontend, wc.status)
+	require.NoError(t, err)
+	warnings = wc.wait()
+
+	require.Len(t, warnings, 0)
+
+	wc = newWarningsCapture()
+	_, err = c.Build(sb.Context(), SolveOpt{
+		FrontendAttrs: map[string]string{},
+	}, "", frontend, wc.status)
+	require.NoError(t, err)
+
+	warnings = wc.wait()
+	require.Len(t, warnings, 1)
+	require.Contains(t, string(warnings[0].Short), "do not match result platforms linux/amd64,linux/arm64")
+}
+
+type warningsCapture struct {
+	status     chan *SolveStatus
+	statusDone chan struct{}
+	done       chan struct{}
+	warnings   []*VertexWarning
+	vertexes   map[digest.Digest]struct{}
+}
+
+func newWarningsCapture() *warningsCapture {
+	w := &warningsCapture{
+		status:     make(chan *SolveStatus),
+		statusDone: make(chan struct{}),
+		done:       make(chan struct{}),
+		vertexes:   map[digest.Digest]struct{}{},
+	}
+
+	go func() {
+		defer close(w.statusDone)
+		for {
+			select {
+			case st, ok := <-w.status:
+				if !ok {
+					return
+				}
+				for _, s := range st.Vertexes {
+					w.vertexes[s.Digest] = struct{}{}
+				}
+				w.warnings = append(w.warnings, st.Warnings...)
+			case <-w.done:
+				return
+			}
+		}
+	}()
+
+	return w
+}
+
+func (w *warningsCapture) wait() []*VertexWarning {
+	select {
+	case <-w.statusDone:
+	case <-time.After(10 * time.Second):
+		close(w.done)
+	}
+
+	<-w.statusDone
+	return w.warnings
 }
 
 func ensureFile(t *testing.T, path string) {
@@ -10405,6 +10570,7 @@ func testLayerLimitOnMounts(t *testing.T, sb integration.Sandbox) {
 }
 
 func testClientCustomGRPCOpts(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	var interceptedMethods []string
 	intercept := func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		interceptedMethods = append(interceptedMethods, method)

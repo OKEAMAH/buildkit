@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -58,6 +59,8 @@ func (sb *sandbox) NewRegistry() (string, error) {
 
 func (sb *sandbox) Cmd(args ...string) *exec.Cmd {
 	if len(args) == 1 {
+		// \\ being stripped off for Windows paths, convert to unix style
+		args[0] = strings.ReplaceAll(args[0], "\\", "/")
 		if split, err := shlex.Split(args[0]); err == nil {
 			args = split
 		}
@@ -65,6 +68,10 @@ func (sb *sandbox) Cmd(args ...string) *exec.Cmd {
 	cmd := exec.Command("buildctl", args...)
 	cmd.Env = append(cmd.Env, os.Environ()...)
 	cmd.Env = append(cmd.Env, "BUILDKIT_HOST="+sb.Address())
+	if v := os.Getenv("GO_TEST_COVERPROFILE"); v != "" {
+		coverDir := filepath.Join(filepath.Dir(v), "helpers")
+		cmd.Env = append(cmd.Env, "GOCOVERDIR="+coverDir)
+	}
 	return cmd
 }
 
@@ -146,7 +153,7 @@ func FormatLogs(m map[string]*bytes.Buffer) string {
 func CheckFeatureCompat(t *testing.T, sb Sandbox, features map[string]struct{}, reason ...string) {
 	t.Helper()
 	if err := HasFeatureCompat(t, sb, features, reason...); err != nil {
-		t.Skipf(err.Error())
+		t.Skip(err.Error())
 	}
 }
 
